@@ -81,6 +81,10 @@ declare module 'electron' {
     exposeInMainWorld(apiKey: string, api: unknown): void
   }
 
+  export interface WebUtils {
+    getPathForFile(file: File): string
+  }
+
   export const BrowserWindow: {
     new (options?: BrowserWindowConstructorOptions): BrowserWindow
     getAllWindows(): BrowserWindow[]
@@ -92,4 +96,5 @@ declare module 'electron' {
   export const shell: Shell
   export const app: App
   export const contextBridge: ContextBridge
+  export const webUtils: WebUtils
 }

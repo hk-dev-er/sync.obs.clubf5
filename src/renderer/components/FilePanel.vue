@@ -146,15 +146,13 @@ function handleItemDoubleClick(item: FileItem) {
   }
 }
 
-function navigateUp() {
+async function navigateUp() {
   const currentPath = props.currentPath
   
   if (props.source === 'local') {
-    // Windows path handling
-    const parts = currentPath.split('\\').filter(p => p)
-    if (parts.length > 1) {
-      parts.pop()
-      emit('navigate', parts.join('\\') + '\\')
+    const parent = await window.electronAPI.getParentPath(currentPath)
+    if (parent && parent !== currentPath) {
+      emit('navigate', parent)
     }
   } else {
     // OBS path handling

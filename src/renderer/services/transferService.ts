@@ -14,6 +14,7 @@ export interface TransferItem {
   size: number
   progress: number
   status: TransferStatus
+  data?: ArrayBuffer
   error?: string
   startTime?: number
   endTime?: number
@@ -77,6 +78,28 @@ class TransferService {
   }
 
   /**
+   * Add an upload to queue that already has its content in memory (e.g. drag & drop)
+   */
+  queueUploadData(remotePath: string, fileName: string, data: ArrayBuffer, size: number): string {
+    const id = `upload-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+    this.queue.value.push({
+      id,
+      type: 'upload',
+      localPath: '',
+      remotePath,
+      fileName,
+      size,
+      progress: 0,
+      status: 'pending',
+      data
+    })
+
+    this.processQueue()
+    return id
+  }
+
+  /**
    * Add download to queue
    */
   queueDownload(remotePath: string, localPath: string, fileName: string, size: number): string {
@@ -133,7 +156,7 @@ class TransferService {
 
     try {
       if (item.type === 'upload') {
-        const buffer = await window.electronAPI.readFileAsBuffer(item.localPath)
+        const buffer = item.data ?? await window.electronAPI.readFileAsBuffer(item.localPath)
         await obsService.uploadObject(item.remotePath, buffer, (progress) => {
           item.progress = progress.percentage
         })

@@ -8,11 +8,11 @@ const uiStore = useUIStore()
 
 const emit = defineEmits<{
   copy: []
-  move: []
   delete: []
   newFolder: []
   sync: []
   refresh: []
+  upload: []
 }>()
 
 const hasSelection = computed(() => uiStore.hasSelectedItems)
@@ -34,19 +34,6 @@ const isConnected = computed(() => configStore.isConnected)
             d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
         </svg>
         <span>Copiar</span>
-      </button>
-
-      <button 
-        @click="emit('move')" 
-        :disabled="!hasSelection"
-        class="toolbar-btn"
-        title="Mover (F6)"
-      >
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-            d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
-        </svg>
-        <span>Mover</span>
       </button>
 
       <button 
@@ -89,6 +76,17 @@ const isConnected = computed(() => configStore.isConnected)
       </button>
 
       <div class="toolbar-separator"></div>
+
+      <button 
+        @click="emit('upload')" 
+        class="toolbar-btn"
+        title="Subir archivos"
+      >
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+        </svg>
+        <span>Subir</span>
+      </button>
 
       <button 
         @click="emit('sync')" 

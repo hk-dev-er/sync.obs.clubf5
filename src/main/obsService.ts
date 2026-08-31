@@ -160,10 +160,10 @@ async function downloadObject(key: string): Promise<Buffer> {
     obsClient.getObject({
       Bucket: currentConfig!.bucket,
       Key: key,
-      SaveAsStream: false
+      SaveAsStream: true
     }, (err: Error | null, result: {
       CommonMsg: { Status: number; Message: string }
-      InterfaceResult: { Content: Buffer | { read?: () => Buffer } }
+      InterfaceResult: { Content: Buffer | NodeJS.ReadableStream }
     }) => {
       if (err) {
         reject(err)
@@ -176,19 +176,16 @@ async function downloadObject(key: string): Promise<Buffer> {
 
       const content = result.InterfaceResult.Content
 
-      // Content can be a Buffer, a readable stream, or other forms depending on SDK version
+      // With SaveAsStream the content is a readable stream; collect it into a Buffer
+      // so binary objects are preserved (a string would corrupt binary data via UTF-8)
       if (Buffer.isBuffer(content)) {
         resolve(content)
       } else if (content && typeof (content as NodeJS.ReadableStream).on === 'function') {
-        // It's a stream - collect chunks
         const chunks: Buffer[] = []
         const stream = content as NodeJS.ReadableStream
         stream.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)))
         stream.on('end', () => resolve(Buffer.concat(chunks)))
         stream.on('error', reject)
-      } else if (content) {
-        // Fallback: try to create a buffer from whatever it is
-        resolve(Buffer.from(content as unknown as ArrayBuffer))
       } else {
         reject(new Error('No content received from OBS'))
       }

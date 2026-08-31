@@ -81,6 +81,13 @@ function registerHandlers() {
     return result.canceled ? null : result.filePaths[0]
   })
 
+  ipcMain.handle('dialog:selectFiles', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections']
+    })
+    return result.canceled ? [] : result.filePaths
+  })
+
   // App handlers
   ipcMain.handle('app:getVersion', () => app.getVersion())
   ipcMain.handle('app:openExternal', (_event, url: string) => shell.openExternal(url))

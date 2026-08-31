@@ -64,7 +64,7 @@ class SyncService {
         processedRemote.add(remoteObj.key)
       }
 
-      const item = this.determineSyncAction(
+      const item = await this.determineSyncAction(
         localFile,
         remoteObj || null,
         localPath,
@@ -77,7 +77,7 @@ class SyncService {
     // Process remote-only files (not in local)
     for (const remoteObj of remoteObjects) {
       if (!processedRemote.has(remoteObj.key)) {
-        const item = this.determineSyncAction(
+        const item = await this.determineSyncAction(
           null,
           remoteObj,
           localPath,
@@ -104,16 +104,18 @@ class SyncService {
   /**
    * Determine sync action for a single item
    */
-  private determineSyncAction(
+  private async determineSyncAction(
     localFile: FileInfo | null,
     remoteObj: OBSObject | null,
     localPath: string,
     remotePath: string,
     mode: SyncMode
-  ): SyncItem {
+  ): Promise<SyncItem> {
     const name = localFile?.name || remoteObj?.name || ''
     const isDirectory = localFile?.isDirectory || remoteObj?.isDirectory || false
-    const localFullPath = localFile ? localFile.path : `${localPath}\\${name}`
+    const localFullPath = localFile
+      ? localFile.path
+      : await window.electronAPI.joinPath(localPath, name)
     const remoteKey = remoteObj?.key || remotePath + name + (isDirectory ? '/' : '')
 
     // Both exist - compare timestamps

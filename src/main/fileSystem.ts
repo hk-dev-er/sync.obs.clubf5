@@ -119,6 +119,14 @@ function getHomePath(): string {
   return homedir()
 }
 
+async function joinPath(_event: IpcMainInvokeEvent, ...segments: string[]): Promise<string> {
+  return path.join(...segments)
+}
+
+async function getParentPath(_event: IpcMainInvokeEvent, filePath: string): Promise<string> {
+  return path.dirname(filePath)
+}
+
 export const fileSystemHandlers = {
   'fs:readDirectory': readDirectory,
   'fs:getFileStats': getFileStats,
@@ -128,5 +136,7 @@ export const fileSystemHandlers = {
   'fs:deleteFolder': deleteFolder,
   'fs:createFolder': createFolder,
   'fs:exists': exists,
-  'fs:getHomePath': getHomePath
+  'fs:getHomePath': getHomePath,
+  'fs:joinPath': joinPath,
+  'fs:getParentPath': getParentPath
 }

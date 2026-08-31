@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
+import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron'
 import type { FileInfo, WatchEvent } from '../../electron'
 
 // Expose protected methods that allow the renderer process to use
@@ -32,12 +32,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getHomePath: (): Promise<string> =>
     ipcRenderer.invoke('fs:getHomePath') as Promise<string>,
 
+  joinPath: (...segments: string[]): Promise<string> =>
+    ipcRenderer.invoke('fs:joinPath', ...segments) as Promise<string>,
+
+  getParentPath: (path: string): Promise<string> =>
+    ipcRenderer.invoke('fs:getParentPath', path) as Promise<string>,
+
+  getPathForFile: (file: File): string => webUtils.getPathForFile(file),
+
   // Dialog operations
   selectFolder: (): Promise<string | null> =>
     ipcRenderer.invoke('dialog:selectFolder') as Promise<string | null>,
 
   selectFile: (filters?: { name: string; extensions: string[] }[]): Promise<string | null> =>
     ipcRenderer.invoke('dialog:selectFile', filters) as Promise<string | null>,
+
+  selectFiles: (): Promise<string[]> =>
+    ipcRenderer.invoke('dialog:selectFiles') as Promise<string[]>,
 
   // Watch operations
   startWatch: (path: string, patterns: string[]): Promise<void> =>

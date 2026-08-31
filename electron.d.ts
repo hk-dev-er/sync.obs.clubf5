@@ -19,10 +19,14 @@ export interface ElectronAPI {
   createFolder: (path: string) => Promise<void>
   exists: (path: string) => Promise<boolean>
   getHomePath: () => Promise<string>
+  joinPath: (...segments: string[]) => Promise<string>
+  getParentPath: (path: string) => Promise<string>
+  getPathForFile: (file: File) => string
   
   // Dialog operations
   selectFolder: () => Promise<string | null>
   selectFile: (filters?: { name: string; extensions: string[] }[]) => Promise<string | null>
+  selectFiles: () => Promise<string[]>
   
   // Watch operations
   startWatch: (path: string, patterns: string[]) => Promise<void>
