@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "description": "Aplicación de escritorio para sincronizar archivos locales con Huawei OBS",
   "main": "dist-electron/main/index.js",
-  "homepage": "https://github.com/clubf5/sync-obs",
+  "homepage": "https://github.com/baselweb-frios/sync.obs.clubf5",
+  "repository": "https://github.com/baselweb-frios/sync.obs.clubf5.git",
   "author": {
     "name": "Club F5",
     "email": "dev@clubf5.com"
