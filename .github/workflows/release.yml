@@ -39,7 +39,10 @@ jobs:
       - name: Instalar dependencias
         run: pnpm install --frozen-lockfile
 
-      - name: Compilar y empaquetar aplicación
-        run: pnpm run build -- --publish always
+      - name: Compilar (typecheck + bundle)
+        run: pnpm exec vue-tsc --noEmit && pnpm exec vite build
+
+      - name: Empaquetar y publicar
+        run: pnpm exec electron-builder --publish always
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}          
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
