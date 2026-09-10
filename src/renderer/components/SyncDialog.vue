@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useConfigStore } from '../stores/configStore'
 import { useUIStore } from '../stores/uiStore'
 import { syncService, type SyncMode, type SyncResult } from '../services/syncService'
+import { obsService, type OBSObject } from '../services/obsService'
 
 const configStore = useConfigStore()
 const uiStore = useUIStore()
@@ -22,6 +23,11 @@ const selectedItems = ref<Set<string>>(new Set())
 const isLoading = ref(false)
 const progress = ref({ current: 0, total: 0, currentFile: '', percentage: 0 })
 const executionResult = ref<{ success: number; failed: number; errors: string[] } | null>(null)
+
+const showObsBrowser = ref(false)
+const obsBrowserPrefix = ref('')
+const obsBrowserItems = ref<OBSObject[]>([])
+const obsBrowserLoading = ref(false)
 
 // Load default paths
 onMounted(() => {
@@ -43,6 +49,52 @@ async function selectLocalPath() {
   if (path) {
     localPath.value = path
   }
+}
+
+async function openObsBrowser() {
+  showObsBrowser.value = true
+  obsBrowserPrefix.value = remotePath.value || ''
+  await loadObsBrowser(obsBrowserPrefix.value)
+}
+
+async function loadObsBrowser(prefix: string) {
+  obsBrowserLoading.value = true
+  try {
+    obsBrowserItems.value = await obsService.listObjects(prefix)
+  } catch (error) {
+    uiStore.notify({
+      type: 'error',
+      title: 'Error al explorar OBS',
+      message: (error as Error).message
+    })
+    obsBrowserItems.value = []
+  } finally {
+    obsBrowserLoading.value = false
+  }
+}
+
+async function navigateObs(prefix: string) {
+  obsBrowserPrefix.value = prefix
+  await loadObsBrowser(prefix)
+}
+
+async function goObsUp() {
+  const prefix = obsBrowserPrefix.value
+  if (!prefix) return
+  const trimmed = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+  const idx = trimmed.lastIndexOf('/')
+  const parent = idx < 0 ? '' : trimmed.slice(0, idx + 1)
+  obsBrowserPrefix.value = parent
+  await loadObsBrowser(parent)
+}
+
+function selectObsPrefix(prefix: string) {
+  remotePath.value = prefix
+  showObsBrowser.value = false
+}
+
+function closeObsBrowser() {
+  showObsBrowser.value = false
 }
 
 async function compare() {
@@ -179,12 +231,17 @@ function close() {
         
         <div class="form-group">
           <label class="form-label">Prefijo remoto (OBS)</label>
-          <input 
-            v-model="remotePath" 
-            type="text" 
-            class="input"
-            placeholder="carpeta/subcarpeta/"
-          />
+          <div class="flex gap-2">
+            <input 
+              v-model="remotePath" 
+              type="text" 
+              class="input flex-1"
+              placeholder="carpeta/subcarpeta/"
+            />
+            <button @click="openObsBrowser" class="btn btn-secondary">
+              Examinar
+            </button>
+          </div>
         </div>
         
         <div class="form-group">
@@ -316,6 +373,69 @@ function close() {
         
         <div class="form-actions">
           <button @click="close" class="btn btn-primary">Cerrar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- OBS Browser Modal -->
+    <div v-if="showObsBrowser" class="obs-browser-overlay" @click.self="closeObsBrowser">
+      <div class="obs-browser-modal">
+        <div class="modal-header">
+          <h2 class="modal-title">Examinar OBS</h2>
+          <button @click="closeObsBrowser" class="close-btn">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <div class="modal-content">
+          <div class="obs-browser-path">
+            <button
+              class="text-btn"
+              :disabled="!obsBrowserPrefix"
+              @click="goObsUp"
+            >
+              ⬆ Subir
+            </button>
+            <button
+              class="text-btn"
+              :disabled="!obsBrowserPrefix"
+              @click="selectObsPrefix('')"
+            >
+              ⏮ Raíz
+            </button>
+            <span class="obs-browser-current">{{ obsBrowserPrefix || '/' }}</span>
+          </div>
+
+          <div class="obs-browser-list">
+            <p v-if="obsBrowserLoading" class="text-center text-gray-500 py-4">Cargando...</p>
+
+            <template v-else>
+              <button
+                v-for="item in obsBrowserItems"
+                :key="item.key"
+                class="obs-browser-item"
+                :disabled="!item.isDirectory"
+                @click="item.isDirectory ? navigateObs(item.key) : undefined"
+              >
+                <span class="item-icon">{{ item.isDirectory ? '📁' : '📄' }}</span>
+                <span class="item-name">{{ item.name }}</span>
+                <span class="obs-browser-select" v-if="item.isDirectory">&gt;</span>
+              </button>
+
+              <p v-if="obsBrowserItems.length === 0" class="text-center text-gray-500 py-4">
+                Esta carpeta está vacía
+              </p>
+            </template>
+          </div>
+
+          <div class="form-actions">
+            <button @click="closeObsBrowser" class="btn btn-secondary">Cancelar</button>
+            <button @click="selectObsPrefix(obsBrowserPrefix)" class="btn btn-primary">
+              Usar esta carpeta
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -495,5 +615,36 @@ function close() {
 
 .error-list ul {
   @apply list-disc list-inside text-xs text-red-600 dark:text-red-300;
+}
+
+.obs-browser-overlay {
+  @apply fixed inset-0 bg-black/50 flex items-center justify-center z-[60];
+}
+
+.obs-browser-modal {
+  @apply bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg max-h-[80vh] overflow-hidden;
+}
+
+.obs-browser-path {
+  @apply flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200;
+}
+
+.obs-browser-current {
+  @apply flex-1 truncate font-mono text-gray-500 dark:text-gray-400;
+}
+
+.obs-browser-list {
+  @apply max-h-64 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded;
+}
+
+.obs-browser-item {
+  @apply w-full flex items-center gap-2 px-3 py-2 text-sm text-left;
+  @apply border-b border-gray-100 dark:border-gray-700 last:border-0;
+  @apply hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors;
+  @apply disabled:opacity-50 disabled:cursor-default;
+}
+
+.obs-browser-select {
+  @apply ml-auto text-gray-400;
 }
 </style>

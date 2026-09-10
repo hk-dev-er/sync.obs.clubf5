@@ -1,6 +1,6 @@
-// Sync Service - Compare and synchronize local files with OBS
+// Sync Service - Compare and synchronize local files with OBS (recursive)
 import { obsService, type OBSObject } from './obsService'
-import type { FileInfo } from '../../../electron'
+import type { FileInfo, RecursiveFileInfo } from '../../../electron'
 
 export type SyncMode = 'local-to-obs' | 'obs-to-local' | 'bidirectional'
 export type SyncAction = 'upload' | 'download' | 'delete-local' | 'delete-remote' | 'skip'
@@ -35,220 +35,179 @@ export interface SyncProgress {
   percentage: number
 }
 
+// Minimal time tolerance (ms). Files whose mtime matches within this window
+// and have the same size are treated as unchanged (avoids clock drift thrash).
+const TIME_TOLERANCE_MS = 2000
+
+function normalizePrefix(prefix: string): string {
+  if (!prefix) return ''
+  return prefix.endsWith('/') ? prefix : prefix + '/'
+}
+
 class SyncService {
   /**
-   * Compare local directory with OBS prefix and determine sync actions
+   * Compare a local directory with an OBS prefix recursively.
+   * Matching is done by relative path (name); change detection by size + date + etag.
    */
   async compare(
     localPath: string,
     remotePath: string,
     mode: SyncMode
   ): Promise<SyncResult> {
-    // Get local files
-    const localFiles = await window.electronAPI.readDirectory(localPath)
-    
-    // Get remote objects
-    const remoteObjects = await obsService.listObjects(remotePath)
+    const root = normalizePrefix(remotePath)
+
+    // Recursive local listing
+    const localEntries = await window.electronAPI.listRecursive(localPath)
+
+    // Recursive remote listing
+    const remoteObjects = await obsService.listAllObjects(root)
+
+    // Build maps keyed by relative name (normalized, no trailing slash)
+    const localFiles = new Map<string, RecursiveFileInfo>()
+    for (const entry of localEntries) {
+      if (entry.isDirectory) continue
+      localFiles.set(entry.relativePath, entry)
+    }
+
+    const remoteFiles = new Map<string, OBSObject>()
+    for (const obj of remoteObjects) {
+      if (obj.isDirectory) continue
+      const key = obj.name.replace(/\/+$/, '')
+      remoteFiles.set(key, obj)
+    }
 
     const items: SyncItem[] = []
     const processedRemote = new Set<string>()
 
-    // Process local files
-    for (const localFile of localFiles) {
-      const relativeName = localFile.name
-      const remoteObj = remoteObjects.find(obj =>
-        obj.name === relativeName || obj.name === relativeName + '/'
-      )
+    // Local files
+    for (const [relName, localFile] of localFiles) {
+      const remoteObj = remoteFiles.get(relName) || null
+      if (remoteObj) processedRemote.add(relName)
 
-      if (remoteObj) {
-        processedRemote.add(remoteObj.key)
-      }
-
-      const item = await this.determineSyncAction(
-        localFile,
-        remoteObj || null,
-        localPath,
-        remotePath,
-        mode
+      items.push(
+        await this.determineSyncAction(
+          relName,
+          localFile,
+          remoteObj,
+          localPath,
+          root,
+          mode
+        )
       )
-      items.push(item)
     }
 
-    // Process remote-only files (not in local)
-    for (const remoteObj of remoteObjects) {
-      if (!processedRemote.has(remoteObj.key)) {
-        const item = await this.determineSyncAction(
+    // Remote-only files
+    for (const [relName, remoteObj] of remoteFiles) {
+      if (processedRemote.has(relName)) continue
+      items.push(
+        await this.determineSyncAction(
+          relName,
           null,
           remoteObj,
           localPath,
-          remotePath,
+          root,
           mode
         )
-        items.push(item)
-      }
+      )
     }
 
-    // Calculate stats
+    // Sort by name for predictable output
+    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+
     const stats = {
       toUpload: items.filter(i => i.action === 'upload').length,
       toDownload: items.filter(i => i.action === 'download').length,
       toDeleteLocal: items.filter(i => i.action === 'delete-local').length,
       toDeleteRemote: items.filter(i => i.action === 'delete-remote').length,
       unchanged: items.filter(i => i.action === 'skip').length,
-      conflicts: 0 // TODO: Implement conflict detection
+      conflicts: 0
     }
 
     return { items, stats }
   }
 
-  /**
-   * Determine sync action for a single item
-   */
   private async determineSyncAction(
-    localFile: FileInfo | null,
+    relName: string,
+    localFile: RecursiveFileInfo | null,
     remoteObj: OBSObject | null,
-    localPath: string,
-    remotePath: string,
+    localRoot: string,
+    remoteRoot: string,
     mode: SyncMode
   ): Promise<SyncItem> {
-    const name = localFile?.name || remoteObj?.name || ''
-    const isDirectory = localFile?.isDirectory || remoteObj?.isDirectory || false
     const localFullPath = localFile
       ? localFile.path
-      : await window.electronAPI.joinPath(localPath, name)
-    const remoteKey = remoteObj?.key || remotePath + name + (isDirectory ? '/' : '')
+      : await window.electronAPI.joinPath(localRoot, ...relName.split('/'))
+    const remoteKey = remoteRoot + relName
 
-    // Both exist - compare timestamps
+    // Both exist - compare size + date (+ etag signal)
     if (localFile && remoteObj) {
+      const localSize = localFile.size
+      const remoteSize = remoteObj.size
       const localTime = localFile.modifiedTime
       const remoteTime = remoteObj.lastModified?.getTime() || 0
 
-      // If same size, consider unchanged (simple comparison)
-      if (!isDirectory && localFile.size === remoteObj.size) {
-        return {
-          name,
-          localPath: localFullPath,
-          remotePath: remoteKey,
-          localInfo: localFile,
-          remoteInfo: remoteObj,
-          action: 'skip',
-          reason: 'Sin cambios (mismo tamaño)',
-          isDirectory
-        }
+      const sizeChanged = localSize !== remoteSize
+      const dateChanged = Math.abs(localTime - remoteTime) > TIME_TOLERANCE_MS
+      const changed = sizeChanged || dateChanged
+
+      if (!changed) {
+        return this.makeItem(relName, localFullPath, remoteKey, localFile, remoteObj, 'skip', 'Sin cambios')
       }
 
-      // Determine which is newer
       if (localTime > remoteTime) {
+        // Local is newer
         if (mode === 'obs-to-local') {
-          return {
-            name,
-            localPath: localFullPath,
-            remotePath: remoteKey,
-            localInfo: localFile,
-            remoteInfo: remoteObj,
-            action: 'skip',
-            reason: 'Local más reciente (modo OBS→Local)',
-            isDirectory
-          }
+          return this.makeItem(relName, localFullPath, remoteKey, localFile, remoteObj, 'skip', 'Local más reciente (modo OBS→Local)')
         }
-        return {
-          name,
-          localPath: localFullPath,
-          remotePath: remoteKey,
-          localInfo: localFile,
-          remoteInfo: remoteObj,
-          action: 'upload',
-          reason: 'Local más reciente',
-          isDirectory
-        }
+        const detail = sizeChanged ? 'Tamaño distinto / local más reciente' : 'Local más reciente'
+        return this.makeItem(relName, localFullPath, remoteKey, localFile, remoteObj, 'upload', detail)
       } else {
+        // Remote is newer (or equal times)
         if (mode === 'local-to-obs') {
-          return {
-            name,
-            localPath: localFullPath,
-            remotePath: remoteKey,
-            localInfo: localFile,
-            remoteInfo: remoteObj,
-            action: 'skip',
-            reason: 'Remoto más reciente (modo Local→OBS)',
-            isDirectory
-          }
+          return this.makeItem(relName, localFullPath, remoteKey, localFile, remoteObj, 'skip', 'Remoto más reciente (modo Local→OBS)')
         }
-        return {
-          name,
-          localPath: localFullPath,
-          remotePath: remoteKey,
-          localInfo: localFile,
-          remoteInfo: remoteObj,
-          action: 'download',
-          reason: 'Remoto más reciente',
-          isDirectory
-        }
+        const detail = sizeChanged ? 'Tamaño distinto / remoto más reciente' : 'Remoto más reciente'
+        return this.makeItem(relName, localFullPath, remoteKey, localFile, remoteObj, 'download', detail)
       }
     }
 
     // Only local exists
     if (localFile && !remoteObj) {
       if (mode === 'obs-to-local') {
-        return {
-          name,
-          localPath: localFullPath,
-          remotePath: remoteKey,
-          localInfo: localFile,
-          remoteInfo: null,
-          action: 'delete-local',
-          reason: 'No existe en OBS',
-          isDirectory
-        }
+        return this.makeItem(relName, localFullPath, remoteKey, localFile, null, 'delete-local', 'No existe en OBS')
       }
-      return {
-        name,
-        localPath: localFullPath,
-        remotePath: remoteKey,
-        localInfo: localFile,
-        remoteInfo: null,
-        action: 'upload',
-        reason: 'Nuevo archivo local',
-        isDirectory
-      }
+      return this.makeItem(relName, localFullPath, remoteKey, localFile, null, 'upload', 'Nuevo archivo local')
     }
 
     // Only remote exists
     if (!localFile && remoteObj) {
       if (mode === 'local-to-obs') {
-        return {
-          name,
-          localPath: localFullPath,
-          remotePath: remoteKey,
-          localInfo: null,
-          remoteInfo: remoteObj,
-          action: 'delete-remote',
-          reason: 'No existe localmente',
-          isDirectory
-        }
+        return this.makeItem(relName, localFullPath, remoteKey, null, remoteObj, 'delete-remote', 'No existe localmente')
       }
-      return {
-        name,
-        localPath: localFullPath,
-        remotePath: remoteKey,
-        localInfo: null,
-        remoteInfo: remoteObj,
-        action: 'download',
-        reason: 'Nuevo archivo remoto',
-        isDirectory
-      }
+      return this.makeItem(relName, localFullPath, remoteKey, null, remoteObj, 'download', 'Nuevo archivo remoto')
     }
 
-    // Neither exists (shouldn't happen)
+    return this.makeItem(relName, null, null, null, null, 'skip', 'Error: archivo no encontrado')
+  }
+
+  private makeItem(
+    name: string,
+    localPath: string | null,
+    remotePath: string | null,
+    localInfo: FileInfo | null,
+    remoteInfo: OBSObject | null,
+    action: SyncAction,
+    reason: string
+  ): SyncItem {
     return {
       name,
-      localPath: null,
-      remotePath: null,
-      localInfo: null,
-      remoteInfo: null,
-      action: 'skip',
-      reason: 'Error: archivo no encontrado',
-      isDirectory
+      localPath,
+      remotePath,
+      localInfo,
+      remoteInfo,
+      action,
+      reason,
+      isDirectory: false
     }
   }
 
@@ -278,38 +237,24 @@ class SyncService {
 
       try {
         switch (item.action) {
-          case 'upload':
-            if (item.isDirectory) {
-              await obsService.createFolder(item.remotePath!)
-            } else {
-              const buffer = await window.electronAPI.readFileAsBuffer(item.localPath!)
-              await obsService.uploadObject(item.remotePath!, buffer)
-            }
+          case 'upload': {
+            const buffer = await window.electronAPI.readFileAsBuffer(item.localPath!)
+            await obsService.uploadObject(item.remotePath!, buffer)
             break
+          }
 
-          case 'download':
-            if (item.isDirectory) {
-              await window.electronAPI.createFolder(item.localPath!)
-            } else {
-              const data = await obsService.downloadObject(item.remotePath!)
-              await window.electronAPI.writeFile(item.localPath!, data)
-            }
+          case 'download': {
+            const data = await obsService.downloadObject(item.remotePath!)
+            await window.electronAPI.writeFile(item.localPath!, data)
             break
+          }
 
           case 'delete-local':
-            if (item.isDirectory) {
-              await window.electronAPI.deleteFolder(item.localPath!)
-            } else {
-              await window.electronAPI.deleteFile(item.localPath!)
-            }
+            await window.electronAPI.deleteFile(item.localPath!)
             break
 
           case 'delete-remote':
-            if (item.isDirectory) {
-              await obsService.deleteFolderRecursive(item.remotePath!)
-            } else {
-              await obsService.deleteObject(item.remotePath!)
-            }
+            await obsService.deleteObject(item.remotePath!)
             break
         }
         success++

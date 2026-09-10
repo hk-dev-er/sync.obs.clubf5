@@ -12,6 +12,16 @@ export interface FileInfo {
   createdTime: number
 }
 
+export interface RecursiveFileInfo {
+  name: string
+  path: string
+  relativePath: string
+  isDirectory: boolean
+  size: number
+  modifiedTime: number
+  createdTime: number
+}
+
 async function readDirectory(_event: IpcMainInvokeEvent, dirPath: string): Promise<FileInfo[]> {
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true })
@@ -127,6 +137,50 @@ async function getParentPath(_event: IpcMainInvokeEvent, filePath: string): Prom
   return path.dirname(filePath)
 }
 
+async function listRecursive(_event: IpcMainInvokeEvent, rootPath: string): Promise<RecursiveFileInfo[]> {
+  const results: RecursiveFileInfo[] = []
+
+  async function walk(dirPath: string) {
+    let entries
+    try {
+      entries = await fs.readdir(dirPath, { withFileTypes: true })
+    } catch {
+      return
+    }
+
+    for (const entry of entries) {
+      let fullPath
+      let stats
+      try {
+        fullPath = path.join(dirPath, entry.name)
+        stats = await fs.stat(fullPath)
+      } catch {
+        continue
+      }
+
+      const isDirectory = entry.isDirectory()
+      const relativePath = path.relative(rootPath, fullPath).split(path.sep).join('/')
+
+      results.push({
+        name: entry.name,
+        path: fullPath,
+        relativePath,
+        isDirectory,
+        size: stats.size,
+        modifiedTime: stats.mtimeMs,
+        createdTime: stats.birthtimeMs
+      })
+
+      if (isDirectory) {
+        await walk(fullPath)
+      }
+    }
+  }
+
+  await walk(rootPath)
+  return results
+}
+
 export const fileSystemHandlers = {
   'fs:readDirectory': readDirectory,
   'fs:getFileStats': getFileStats,
@@ -138,5 +192,6 @@ export const fileSystemHandlers = {
   'fs:exists': exists,
   'fs:getHomePath': getHomePath,
   'fs:joinPath': joinPath,
-  'fs:getParentPath': getParentPath
+  'fs:getParentPath': getParentPath,
+  'fs:listRecursive': listRecursive
 }

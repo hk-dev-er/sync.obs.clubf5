@@ -8,9 +8,20 @@ export interface FileInfo {
   createdTime: number
 }
 
+export interface RecursiveFileInfo {
+  name: string
+  path: string
+  relativePath: string
+  isDirectory: boolean
+  size: number
+  modifiedTime: number
+  createdTime: number
+}
+
 export interface ElectronAPI {
   // File system operations
   readDirectory: (path: string) => Promise<FileInfo[]>
+  listRecursive: (path: string) => Promise<RecursiveFileInfo[]>
   getFileStats: (path: string) => Promise<FileInfo>
   readFileAsBuffer: (path: string) => Promise<ArrayBuffer>
   writeFile: (path: string, data: ArrayBuffer) => Promise<void>
@@ -43,6 +54,7 @@ export interface ElectronAPI {
   obsTestConnection: () => Promise<boolean>
   obsIsInitialized: () => Promise<boolean>
   obsListObjects: (prefix: string) => Promise<unknown[]>
+  obsListAllObjects: (prefix: string) => Promise<unknown[]>
   obsUploadObject: (key: string, data: ArrayBuffer) => Promise<boolean>
   obsDownloadObject: (key: string) => Promise<ArrayBuffer>
   obsDeleteObject: (key: string) => Promise<boolean>

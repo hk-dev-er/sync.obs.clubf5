@@ -23,6 +23,9 @@ let obsClient: typeof ObsClient | null = null
 let currentConfig: OBSConfig | null = null
 
 function initialize(config: OBSConfig): void {
+  if (!config || !config.endpoint) {
+    throw new Error('Endpoint OBS no configurado')
+  }
   currentConfig = config
   obsClient = new ObsClient({
     access_key_id: config.accessKeyId,
@@ -262,6 +265,71 @@ async function createFolder(prefix: string): Promise<void> {
   })
 }
 
+async function listAllObjects(prefix: string = ''): Promise<OBSObject[]> {
+  if (!obsClient || !currentConfig) {
+    throw new Error('OBS client not initialized')
+  }
+
+  const objects: OBSObject[] = []
+
+  const listPage = (marker?: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const params: Record<string, unknown> = {
+        Bucket: currentConfig!.bucket,
+        Prefix: prefix,
+        MaxKeys: 1000
+      }
+      if (marker) params.Marker = marker
+
+      obsClient.listObjects(params, (err: Error | null, result: {
+        CommonMsg: { Status: number; Message: string }
+        InterfaceResult: {
+          Contents?: { Key: string; Size: number; LastModified: string; ETag: string }[]
+          IsTruncated?: boolean
+          NextMarker?: string
+        }
+      }) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        if (result.CommonMsg.Status !== 200) {
+          reject(new Error(`Failed to list objects: ${result.CommonMsg.Message}`))
+          return
+        }
+
+        const iface = result.InterfaceResult
+        if (iface.Contents) {
+          for (const obj of iface.Contents) {
+            const key = obj.Key
+            if (key === prefix) continue
+            const name = key.replace(prefix, '')
+            if (!name) continue
+            const isDirectory = key.endsWith('/')
+            objects.push({
+              key,
+              name,
+              isDirectory,
+              size: isDirectory ? 0 : obj.Size,
+              lastModified: obj.LastModified || null,
+              etag: obj.ETag
+            })
+          }
+        }
+
+        if (iface.IsTruncated && iface.NextMarker) {
+          listPage(iface.NextMarker).then(resolve, reject)
+        } else {
+          resolve()
+        }
+      })
+    })
+  }
+
+  await listPage()
+  return objects
+}
+
 async function getObjectMetadata(key: string): Promise<{ size: number; lastModified: string; etag: string } | null> {
   if (!obsClient || !currentConfig) {
     throw new Error('OBS client not initialized')
@@ -305,6 +373,10 @@ export const obsHandlers: Record<string, (event: IpcMainInvokeEvent, ...args: un
 
   'obs:listObjects': async (_, prefix: string) => {
     return listObjects(prefix || '')
+  },
+
+  'obs:listAllObjects': async (_, prefix: string) => {
+    return listAllObjects(prefix || '')
   },
 
   'obs:uploadObject': async (_, key: string, data: ArrayBuffer) => {

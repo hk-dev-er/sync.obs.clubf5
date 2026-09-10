@@ -92,6 +92,29 @@ class OBSService {
   }
 
   /**
+   * List all objects under a prefix recursively (no delimiter)
+   */
+  async listAllObjects(prefix: string = ''): Promise<OBSObject[]> {
+    if (!this.initialized) {
+      throw new Error('OBS client not initialized')
+    }
+
+    const objects = await window.electronAPI.obsListAllObjects(prefix) as Array<{
+      key: string
+      name: string
+      isDirectory: boolean
+      size: number
+      lastModified: string | null
+      etag?: string
+    }>
+
+    return objects.map(obj => ({
+      ...obj,
+      lastModified: obj.lastModified ? new Date(obj.lastModified) : null
+    }))
+  }
+
+  /**
    * Upload a file to OBS
    */
   async uploadObject(

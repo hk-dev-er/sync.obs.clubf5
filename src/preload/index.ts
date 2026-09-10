@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron'
-import type { FileInfo, WatchEvent } from '../../electron'
+import type { FileInfo, RecursiveFileInfo, WatchEvent } from '../../electron'
 
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // File system operations
   readDirectory: (path: string): Promise<FileInfo[]> =>
     ipcRenderer.invoke('fs:readDirectory', path) as Promise<FileInfo[]>,
+
+  listRecursive: (path: string): Promise<RecursiveFileInfo[]> =>
+    ipcRenderer.invoke('fs:listRecursive', path) as Promise<RecursiveFileInfo[]>,
 
   getFileStats: (path: string): Promise<FileInfo> =>
     ipcRenderer.invoke('fs:getFileStats', path) as Promise<FileInfo>,
@@ -83,6 +86,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   obsListObjects: (prefix: string): Promise<unknown[]> =>
     ipcRenderer.invoke('obs:listObjects', prefix) as Promise<unknown[]>,
+
+  obsListAllObjects: (prefix: string): Promise<unknown[]> =>
+    ipcRenderer.invoke('obs:listAllObjects', prefix) as Promise<unknown[]>,
 
   obsUploadObject: (key: string, data: ArrayBuffer): Promise<boolean> =>
     ipcRenderer.invoke('obs:uploadObject', key, data) as Promise<boolean>,

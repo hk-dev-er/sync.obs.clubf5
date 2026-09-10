@@ -35,7 +35,11 @@ export const useConfigStore = defineStore('config', () => {
   const connectionError = ref<string | null>(null)
 
   // Computed
-  const hasOBSConfig = computed(() => config.value.obs !== null)
+  const hasOBSConfig = computed(() => {
+    const obs = config.value.obs
+    if (!obs) return false
+    return Boolean(obs.accessKeyId && obs.secretAccessKey && obs.endpoint && obs.bucket)
+  })
   
   const effectiveTheme = computed(() => {
     if (config.value.theme === 'system') {
