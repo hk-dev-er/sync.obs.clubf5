@@ -4,8 +4,6 @@ Aplicación de escritorio multiplataforma para sincronizar archivos locales con 
 
 ## Características
 
-- 📁 **Navegación dual**: Paneles estilo Total Commander (Local | OBS)
-- ⬆️ **Upload/Download**: Transferencia de archivos con progreso
 - 🔄 **Sincronización**: Comparar y sincronizar carpetas
 - 👁️ **Watch automático**: Detectar cambios en tiempo real
 - 🎯 **Filtros**: Patrones de exclusión configurables
