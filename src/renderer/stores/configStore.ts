@@ -1,183 +1,113 @@
+import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import { obsService, type OBSConfig } from '../services/obsService'
+import type { OBSConfigInput, OBSConfigStatus } from '../../shared/contracts'
+import type { DestinationPrefix } from '../../shared/uploadPolicy'
 
-export interface AppConfig {
-  obs: OBSConfig | null
-  localPath: string
-  remotePath: string
-  excludePatterns: string[]
-  watchEnabled: boolean
-  theme: 'light' | 'dark' | 'system'
-}
+type Theme = 'light' | 'dark' | 'system'
 
 export const useConfigStore = defineStore('config', () => {
-  // State
-  const config = ref<AppConfig>({
-    obs: null,
-    localPath: '',
-    remotePath: '',
-    excludePatterns: [
-      '*.tmp',
-      '*.log',
-      '*.bak',
-      'node_modules/**',
-      '.git/**',
-      'Thumbs.db',
-      '.DS_Store'
-    ],
-    watchEnabled: false,
-    theme: 'system'
+  const localPath = ref('')
+  const destination = ref<DestinationPrefix>('Music/online/Progressive/')
+  const theme = ref<Theme>('system')
+  const obsStatus = ref<OBSConfigStatus>({
+    configured: false,
+    endpoint: '',
+    bucket: '',
+    accessKeyIdHint: ''
   })
-
   const isConnected = ref(false)
   const isLoading = ref(false)
   const connectionError = ref<string | null>(null)
 
-  // Computed
-  const hasOBSConfig = computed(() => {
-    const obs = config.value.obs
-    if (!obs) return false
-    return Boolean(obs.accessKeyId && obs.secretAccessKey && obs.endpoint && obs.bucket)
-  })
-  
-  const effectiveTheme = computed(() => {
-    if (config.value.theme === 'system') {
+  const hasOBSConfig = computed(() => obsStatus.value.configured)
+  const effectiveTheme = computed<'light' | 'dark'>(() => {
+    if (theme.value === 'system') {
       return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
     }
-    return config.value.theme
+    return theme.value
   })
 
-  // Actions
+  function applyTheme(): void {
+    document.documentElement.classList.toggle('dark', effectiveTheme.value === 'dark')
+  }
+
   async function loadConfig(): Promise<void> {
     isLoading.value = true
     try {
-      const savedObs = await window.electronAPI.getConfig<OBSConfig>('obs')
-      const savedLocalPath = await window.electronAPI.getConfig<string>('localPath')
-      const savedRemotePath = await window.electronAPI.getConfig<string>('remotePath')
-      const savedPatterns = await window.electronAPI.getConfig<string[]>('excludePatterns')
-      const savedWatch = await window.electronAPI.getConfig<boolean>('watchEnabled')
-      const savedTheme = await window.electronAPI.getConfig<'light' | 'dark' | 'system'>('theme')
+      localPath.value = await window.electronAPI.getPreference<string>('localPath') ?? ''
+      destination.value = await window.electronAPI.getPreference<DestinationPrefix>('destination')
+        ?? 'Music/online/Progressive/'
+      theme.value = await window.electronAPI.getPreference<Theme>('theme') ?? 'system'
+      obsStatus.value = await window.electronAPI.getOBSStatus()
+      applyTheme()
 
-      if (savedObs) config.value.obs = savedObs
-      if (savedLocalPath) config.value.localPath = savedLocalPath
-      if (savedRemotePath) config.value.remotePath = savedRemotePath
-      if (savedPatterns) config.value.excludePatterns = savedPatterns
-      if (savedWatch !== undefined) config.value.watchEnabled = savedWatch
-      if (savedTheme) config.value.theme = savedTheme
-
-      // Try to connect if we have OBS config
-      if (config.value.obs) {
-        await connect()
-      }
-    } catch (error) {
-      console.error('Failed to load config:', error)
-    } finally {
-      isLoading.value = false
-    }
-  }
-
-  async function saveOBSConfig(obsConfig: OBSConfig): Promise<void> {
-    config.value.obs = obsConfig
-    // Convert to plain object to avoid IPC cloning issues with Vue proxies
-    await window.electronAPI.setConfig('obs', JSON.parse(JSON.stringify(obsConfig)))
-  }
-
-  async function saveLocalPath(path: string): Promise<void> {
-    config.value.localPath = path
-    await window.electronAPI.setConfig('localPath', path)
-  }
-
-  async function saveRemotePath(path: string): Promise<void> {
-    config.value.remotePath = path
-    await window.electronAPI.setConfig('remotePath', path)
-  }
-
-  async function saveExcludePatterns(patterns: string[]): Promise<void> {
-    config.value.excludePatterns = patterns
-    // Convert to plain array to avoid IPC cloning issues
-    await window.electronAPI.setConfig('excludePatterns', [...patterns])
-  }
-
-  async function saveWatchEnabled(enabled: boolean): Promise<void> {
-    config.value.watchEnabled = enabled
-    await window.electronAPI.setConfig('watchEnabled', enabled)
-  }
-
-  async function saveTheme(theme: 'light' | 'dark' | 'system'): Promise<void> {
-    config.value.theme = theme
-    await window.electronAPI.setConfig('theme', theme)
-    applyTheme()
-  }
-
-  async function connect(): Promise<boolean> {
-    if (!config.value.obs) {
-      connectionError.value = 'No hay configuración OBS'
-      return false
-    }
-
-    isLoading.value = true
-    connectionError.value = null
-
-    try {
-      // Initialize is now async (uses IPC)
-      await obsService.initialize(config.value.obs)
-      const success = await obsService.testConnection()
-      
-      if (success) {
-        isConnected.value = true
-        return true
-      } else {
-        connectionError.value = 'No se pudo conectar al bucket'
-        return false
+      if (obsStatus.value.configured) {
+        isConnected.value = await window.electronAPI.obsConnectStored()
+        if (!isConnected.value) connectionError.value = 'No se pudo conectar con la credencial guardada'
       }
     } catch (error) {
       connectionError.value = (error as Error).message
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  async function configureOBS(config: OBSConfigInput): Promise<boolean> {
+    isLoading.value = true
+    connectionError.value = null
+    try {
+      const connected = await window.electronAPI.obsConfigure(config)
+      isConnected.value = connected
+      if (connected) {
+        obsStatus.value = await window.electronAPI.getOBSStatus()
+      } else {
+        connectionError.value = 'La credencial o los datos del bucket fueron rechazados'
+      }
+      return connected
+    } catch (error) {
+      connectionError.value = (error as Error).message
+      isConnected.value = false
       return false
     } finally {
       isLoading.value = false
     }
   }
 
-  function disconnect(): void {
-    isConnected.value = false
+  async function saveLocalPath(value: string): Promise<void> {
+    localPath.value = value
+    await window.electronAPI.setPreference('localPath', value)
   }
 
-  function applyTheme(): void {
-    const theme = effectiveTheme.value
-    if (theme === 'dark') {
-      document.documentElement.classList.add('dark')
-    } else {
-      document.documentElement.classList.remove('dark')
-    }
+  async function saveDestination(value: DestinationPrefix): Promise<void> {
+    destination.value = value
+    await window.electronAPI.setPreference('destination', value)
   }
 
-  // Apply theme on init
-  applyTheme()
+  async function saveTheme(value: Theme): Promise<void> {
+    theme.value = value
+    await window.electronAPI.setPreference('theme', value)
+    applyTheme()
+  }
 
-  // Watch for system theme changes
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-    if (config.value.theme === 'system') {
-      applyTheme()
-    }
+    if (theme.value === 'system') applyTheme()
   })
 
   return {
-    config,
+    localPath,
+    destination,
+    theme,
+    obsStatus,
     isConnected,
     isLoading,
     connectionError,
     hasOBSConfig,
     effectiveTheme,
     loadConfig,
-    saveOBSConfig,
+    configureOBS,
     saveLocalPath,
-    saveRemotePath,
-    saveExcludePatterns,
-    saveWatchEnabled,
+    saveDestination,
     saveTheme,
-    connect,
-    disconnect,
     applyTheme
   }
 })

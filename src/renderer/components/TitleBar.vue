@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const appTitle = 'Sync OBS'
+const appTitle = 'ClubF5 Cargador OBS'
 
 const minimize = () => window.electronAPI.minimize()
 const maximize = () => window.electronAPI.maximize()

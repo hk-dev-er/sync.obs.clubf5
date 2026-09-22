@@ -10,25 +10,18 @@ permissions:
 
 jobs:
   release:
-    name: Compilar en ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Compilar Windows
+    runs-on: windows-latest
 
     # Detiene la cancelación en cadena si una máquina falla
     # Incrementa el tiempo límite de ejecución a 30 minutos por máquina
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
 
       - name: Instalar pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Configurar Node.js
         uses: actions/setup-node@v4
@@ -40,7 +33,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Compilar (typecheck + bundle)
-        run: pnpm exec vue-tsc --noEmit && pnpm exec vite build
+        run: pnpm test && pnpm typecheck && pnpm exec vite build
 
       - name: Empaquetar y publicar
         run: pnpm exec electron-builder --publish always
