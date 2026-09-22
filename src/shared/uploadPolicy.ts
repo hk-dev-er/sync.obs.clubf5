@@ -1,12 +1,41 @@
-export const ALLOWED_DESTINATIONS = [
-  'Music/online/Progressive/',
-  'Music/online/Melodic_Techno/'
-] as const
+export const MUSIC_ROOT = 'Music/online/' as const
 
-export type DestinationPrefix = (typeof ALLOWED_DESTINATIONS)[number]
+export type DestinationPrefix = `${typeof MUSIC_ROOT}${string}/`
 
 export function isAllowedDestination(value: string): value is DestinationPrefix {
-  return (ALLOWED_DESTINATIONS as readonly string[]).includes(value)
+  if (!value.startsWith(MUSIC_ROOT) || !value.endsWith('/')) return false
+  const folderName = value.slice(MUSIC_ROOT.length, -1)
+  return Boolean(
+    folderName &&
+    folderName !== '.' &&
+    folderName !== '..' &&
+    !folderName.includes('/') &&
+    !/[\u0000-\u001f\u007f]/.test(folderName)
+  )
+}
+
+export function destinationLabel(destination: DestinationPrefix): string {
+  return destination.slice(MUSIC_ROOT.length, -1).replace(/_/g, ' ')
+}
+
+export function destinationFromObjectKey(key: string): DestinationPrefix | null {
+  if (!key.startsWith(MUSIC_ROOT)) return null
+  const folderName = key.slice(MUSIC_ROOT.length).split('/')[0]
+  const destination = `${MUSIC_ROOT}${folderName}/`
+  return isAllowedDestination(destination) ? destination : null
+}
+
+export function musicDestinationsFromCommonPrefixes(values: unknown[]): DestinationPrefix[] {
+  const destinations = new Set<DestinationPrefix>()
+  for (const value of values) {
+    const prefix = typeof value === 'string'
+      ? value
+      : value && typeof value === 'object' && 'Prefix' in value
+        ? (value as { Prefix?: unknown }).Prefix
+        : null
+    if (typeof prefix === 'string' && isAllowedDestination(prefix)) destinations.add(prefix)
+  }
+  return [...destinations].sort((left, right) => left.localeCompare(right, 'es', { sensitivity: 'base' }))
 }
 
 export function normalizeRelativePath(value: string): string {

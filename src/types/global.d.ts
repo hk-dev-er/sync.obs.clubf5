@@ -25,6 +25,7 @@ export interface ElectronAPI {
   obsConfigure: (config: OBSConfigInput) => Promise<boolean>
   obsConnectStored: () => Promise<boolean>
   obsTestConnection: () => Promise<boolean>
+  obsListMusicFolders: () => Promise<DestinationPrefix[]>
   obsListAllObjects: (prefix: DestinationPrefix) => Promise<RemoteAudioFile[]>
   obsGetObjectMetadata: (key: string) => Promise<RemoteObjectMetadata | null>
   obsUploadFile: (request: UploadRequest) => Promise<UploadResult>

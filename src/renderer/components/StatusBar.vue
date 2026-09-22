@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useConfigStore } from '../stores/configStore'
+import { destinationLabel } from '../../shared/uploadPolicy'
 
 const configStore = useConfigStore()
-const destination = computed(() => configStore.destination.includes('Melodic_Techno') ? 'Melodic Techno' : 'Progressive')
+const destination = computed(() => destinationLabel(configStore.destination))
 </script>
 
 <template>

@@ -13,16 +13,21 @@ import type {
 } from '../shared/contracts'
 import type { RemoteAudioFile } from '../shared/syncPlan'
 import {
-  ALLOWED_DESTINATIONS,
   buildBackupKey,
   buildObjectKey,
-  isAllowedDestination
+  destinationFromObjectKey,
+  type DestinationPrefix,
+  isAllowedDestination,
+  musicDestinationsFromCommonPrefixes,
+  MUSIC_ROOT
 } from '../shared/uploadPolicy'
 import { hashAndValidateOgg, validateLocalAudioPath } from './fileSystem'
 import { loadOBSConfig, saveOBSConfig } from './configService'
 
 let obsClient: InstanceType<typeof ObsClient> | null = null
 let currentConfig: OBSConfigInput | null = null
+let discoveredMusicFolders = new Set<DestinationPrefix>()
+let connectionGeneration = 0
 
 function createClient(config: OBSConfigInput): InstanceType<typeof ObsClient> {
   return new ObsClient({
@@ -60,6 +65,8 @@ async function configure(config: OBSConfigInput): Promise<boolean> {
   obsClient?.close?.()
   obsClient = candidate
   currentConfig = { ...config }
+  discoveredMusicFolders = new Set()
+  connectionGeneration += 1
   saveOBSConfig(config)
   return true
 }
@@ -76,6 +83,8 @@ async function connectStored(): Promise<boolean> {
   obsClient?.close?.()
   obsClient = client
   currentConfig = config
+  discoveredMusicFolders = new Set()
+  connectionGeneration += 1
   return true
 }
 
@@ -84,10 +93,19 @@ function requireConnection(): { client: InstanceType<typeof ObsClient>; config: 
   return { client: obsClient, config: currentConfig }
 }
 
-function assertSafeKey(key: string): void {
-  if (!ALLOWED_DESTINATIONS.some(prefix => key.startsWith(prefix)) || !key.toLowerCase().endsWith('.ogg')) {
+function requireDiscoveredDestination(value: string): DestinationPrefix {
+  if (!isAllowedDestination(value) || !discoveredMusicFolders.has(value)) {
+    throw new Error('La carpeta musical ya no está disponible. Actualizá la lista de destinos.')
+  }
+  return value
+}
+
+function assertSafeKey(key: string): DestinationPrefix {
+  const destination = destinationFromObjectKey(key)
+  if (!destination || !discoveredMusicFolders.has(destination) || !key.toLowerCase().endsWith('.ogg')) {
     throw new Error('La ruta OBS no está autorizada')
   }
+  return destination
 }
 
 function cleanEtag(value: unknown): string | null {
@@ -96,13 +114,13 @@ function cleanEtag(value: unknown): string | null {
 }
 
 async function listAllObjects(prefix: string): Promise<RemoteAudioFile[]> {
-  if (!isAllowedDestination(prefix)) throw new Error('La carpeta OBS no está autorizada')
+  const destination = requireDiscoveredDestination(prefix)
   const { client, config } = requireConnection()
   const objects: RemoteAudioFile[] = []
 
   const listPage = async (marker?: string): Promise<void> => {
     const result = await new Promise((resolve, reject) => {
-      const params: Record<string, unknown> = { Bucket: config.bucket, Prefix: prefix, MaxKeys: 1000 }
+      const params: Record<string, unknown> = { Bucket: config.bucket, Prefix: destination, MaxKeys: 1000 }
       if (marker) params.Marker = marker
       client.listObjects(params, (error, response) => error ? reject(error) : resolve(response))
     })
@@ -112,10 +130,10 @@ async function listAllObjects(prefix: string): Promise<RemoteAudioFile[]> {
     }
 
     for (const object of result.InterfaceResult.Contents ?? []) {
-      if (object.Key === prefix || object.Key.endsWith('/') || !object.Key.toLowerCase().endsWith('.ogg')) continue
+      if (object.Key === destination || object.Key.endsWith('/') || !object.Key.toLowerCase().endsWith('.ogg')) continue
       objects.push({
         key: object.Key,
-        relativePath: object.Key.slice(prefix.length).normalize('NFC'),
+        relativePath: object.Key.slice(destination.length).normalize('NFC'),
         size: Number(object.Size),
         etag: cleanEtag(object.ETag),
         lastModified: object.LastModified ?? null
@@ -131,8 +149,66 @@ async function listAllObjects(prefix: string): Promise<RemoteAudioFile[]> {
   return objects
 }
 
+async function listMusicFolders(): Promise<DestinationPrefix[]> {
+  const { client, config } = requireConnection()
+  const generation = connectionGeneration
+  const folders = new Set<DestinationPrefix>()
+
+  const listPage = async (marker?: string): Promise<void> => {
+    const result = await new Promise((resolve, reject) => {
+      const params: Record<string, unknown> = {
+        Bucket: config.bucket,
+        Prefix: MUSIC_ROOT,
+        Delimiter: '/',
+        MaxKeys: 1000
+      }
+      if (marker) params.Marker = marker
+      client.listObjects(params, (error, response) => error ? reject(error) : resolve(response))
+    })
+
+    if (result.CommonMsg.Status !== 200) {
+      throw new Error(`OBS no pudo listar las carpetas musicales: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
+    }
+
+    for (const prefix of musicDestinationsFromCommonPrefixes(result.InterfaceResult.CommonPrefixes ?? [])) {
+      folders.add(prefix)
+    }
+
+    if (result.InterfaceResult.IsTruncated && result.InterfaceResult.NextMarker) {
+      await listPage(result.InterfaceResult.NextMarker)
+    }
+  }
+
+  await listPage()
+  if (generation !== connectionGeneration) {
+    throw new Error('La conexión OBS cambió mientras se consultaban las carpetas. Actualizá la lista.')
+  }
+  const ordered = [...folders].sort((left, right) => left.localeCompare(right, 'es', { sensitivity: 'base' }))
+  discoveredMusicFolders = new Set(ordered)
+  return ordered
+}
+
+async function assertDestinationStillExists(destination: DestinationPrefix): Promise<void> {
+  const { client, config } = requireConnection()
+  const result = await new Promise((resolve, reject) => {
+    client.listObjects({
+      Bucket: config.bucket,
+      Prefix: destination,
+      MaxKeys: 1
+    }, (error, response) => error ? reject(error) : resolve(response))
+  })
+
+  if (result.CommonMsg.Status !== 200) {
+    throw new Error(`OBS no pudo verificar la carpeta musical: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
+  }
+  if (!(result.InterfaceResult.Contents ?? []).some(item => item.Key?.startsWith(destination))) {
+    discoveredMusicFolders.delete(destination)
+    throw new Error('La carpeta musical dejó de existir en OBS. No se creó ninguna carpeta nueva.')
+  }
+}
+
 async function getMetadata(key: string): Promise<RemoteObjectMetadata | null> {
-  assertSafeKey(key)
+  const prefix = assertSafeKey(key)
   const { client, config } = requireConnection()
 
   return new Promise((resolve, reject) => {
@@ -145,7 +221,6 @@ async function getMetadata(key: string): Promise<RemoteObjectMetadata | null> {
       }
 
       const metadata = result.InterfaceResult.Metadata ?? {}
-      const prefix = ALLOWED_DESTINATIONS.find(candidate => key.startsWith(candidate))!
       resolve({
         key,
         relativePath: key.slice(prefix.length),
@@ -176,6 +251,8 @@ async function copyForBackup(sourceKey: string, backupKey: string): Promise<void
 
 async function putFile(event: IpcMainInvokeEvent, request: UploadRequest): Promise<UploadResult> {
   const { client, config } = requireConnection()
+  const destination = requireDiscoveredDestination(request.destination)
+  await assertDestinationStillExists(destination)
   const key = buildObjectKey(request.destination, request.relativePath)
   const localPath = await validateLocalAudioPath(request.localPath, request.relativePath)
   const stats = await fs.stat(localPath)
@@ -258,6 +335,7 @@ export const obsHandlers: Record<string, (event: IpcMainInvokeEvent, ...args: an
     const { client, config } = requireConnection()
     return headBucket(client, config.bucket)
   },
+  'obs:listMusicFolders': async () => listMusicFolders(),
   'obs:listAllObjects': async (_event, prefix: string) => listAllObjects(prefix),
   'obs:getObjectMetadata': async (_event, key: string) => getMetadata(key),
   'obs:uploadFile': putFile
