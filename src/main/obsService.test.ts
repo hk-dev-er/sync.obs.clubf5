@@ -100,6 +100,42 @@ describe('uploader account and resumable transfer', () => {
     vi.unstubAllGlobals()
   })
 
+  it('asks the API to finish a job interrupted after the completing transition', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input)
+      calls.push(`${init?.method ?? 'GET'} ${url}`)
+      if (url.endsWith('/token/login')) return json({ access_token: 'jwt', refresh_token: 'refresh' })
+      if (url.endsWith('/music-uploader/me')) return json({ username: 'operator', tenantId: 7,
+        displayName: 'Operador', allowedPrefixes: ['Music/online/Progressive/'] })
+      if (url.endsWith('/music-uploader/sessions')) return json([{ id: 'session', expiresAt: '2099-01-01' }])
+      if (url.endsWith('/music-uploader/sessions/session/jobs')) return json({ jobs: [{
+        id: 'job', clientFileId: 'file', objectKey: key, sizeBytes: bytes.length,
+        sha256, partSizeBytes: 8 * 1024 * 1024, partCount: 1,
+        replaceExisting: false, previousETag: null, backupKey: null, status: 'completing'
+      }] })
+      if (url.endsWith('/files/job/complete') && init?.method === 'POST') return json({
+        id: 'job', objectKey: key, sizeBytes: bytes.length, sha256,
+        backupKey: null, status: 'completed'
+      })
+      if (url.includes('/objects/metadata?')) return json({ sizeBytes: bytes.length,
+        eTag: 'final-etag', sha256, jobId: 'job', lastModified: null })
+      throw new Error(`Unexpected request: ${url}`)
+    }))
+
+    await obsHandlers['auth:login']({} as never, { username: 'operator', password: 'secret' })
+    const result = await obsHandlers['obs:uploadFile']({ sender: { send: vi.fn() } } as never, {
+      transferId: 'transfer', localPath: path, relativePath: 'test.ogg',
+      destination: 'Music/online/Progressive/', allowReplace: false,
+      expectedRemote: null, digest
+    })
+
+    expect(result).toMatchObject({ key, verified: true })
+    expect(calls.some(call => call.includes('POST ') && call.endsWith('/files/job/complete'))).toBe(true)
+    expect(calls.some(call => call.startsWith('PUT https://'))).toBe(false)
+    vi.unstubAllGlobals()
+  })
+
   it('uploads a new part with its signed MD5 and never forwards the ClubF5 token to OBS', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     let metadataReads = 0

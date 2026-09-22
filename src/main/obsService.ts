@@ -263,11 +263,8 @@ async function uploadFile(event: IpcMainInvokeEvent, request: UploadRequest): Pr
   }
   const resumed = await sessionFor(request, key)
   if (resumed.job?.status === 'completing') {
-    resumed.job = (await api<{ job: Job }>(
-      `/music-uploader/sessions/${resumed.session.id}/files/${resumed.job.id}`)).job
-    if (resumed.job.status !== 'completed') {
-      throw new Error('La carga anterior requiere verificación antes de repetirla')
-    }
+    resumed.job = await api<Job>(
+      `/music-uploader/sessions/${resumed.session.id}/files/${resumed.job.id}/complete`, 'POST')
   }
   if (resumed.job?.status === 'completed') {
     const published = await getMetadata(key)
@@ -276,6 +273,8 @@ async function uploadFile(event: IpcMainInvokeEvent, request: UploadRequest): Pr
       return { key, replaced: request.allowReplace, backupKey: resumed.job.backupKey,
         verified: true, etag: published.etag }
     }
+    // The completed object may have been removed later. Do not reuse its old job.
+    resumed.job = null
   }
   const remote = await getMetadata(key)
   if (remote && !request.allowReplace) throw new Error('El archivo apareció en OBS. Compará nuevamente.')
@@ -318,7 +317,7 @@ async function uploadFile(event: IpcMainInvokeEvent, request: UploadRequest): Pr
       job = await api<Job>(`/music-uploader/sessions/${session.id}/files/${job.id}/complete`, 'POST')
     }
     if (job.status === 'completing') {
-      job = (await api<{ job: Job }>(`/music-uploader/sessions/${session.id}/files/${job.id}`)).job
+      job = await api<Job>(`/music-uploader/sessions/${session.id}/files/${job.id}/complete`, 'POST')
     }
   }
   if (job.status !== 'completed') throw new Error('La carga no quedó confirmada. Podés reanudarla más tarde.')
