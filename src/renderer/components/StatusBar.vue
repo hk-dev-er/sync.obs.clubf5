@@ -11,7 +11,7 @@ const destination = computed(() => destinationLabel(configStore.destination))
   <footer class="status-bar">
     <div class="status-section">
       <span :class="['status-indicator', { connected: configStore.isConnected }]"></span>
-      <span>{{ configStore.isConnected ? 'OBS conectado' : 'OBS desconectado' }}</span>
+      <span>{{ configStore.isConnected ? 'Sesión de carga activa' : 'Sin sesión de carga' }}</span>
     </div>
     <div class="status-section"><span>Destino: {{ destination }}</span></div>
     <div class="flex-1"></div>

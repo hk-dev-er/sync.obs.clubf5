@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useConfigStore } from '../stores/configStore'
 import { useUIStore } from '../stores/uiStore'
 
@@ -7,15 +7,10 @@ const emit = defineEmits<{ close: [] }>()
 const configStore = useConfigStore()
 const uiStore = useUIStore()
 const saving = ref(false)
-const form = ref({ accessKeyId: '', secretAccessKey: '', endpoint: '', bucket: '' })
+const form = ref({ username: '', password: '' })
 
-const canClose = computed(() => configStore.hasOBSConfig)
+const canClose = computed(() => configStore.hasOperatorSession)
 const canSave = computed(() => Object.values(form.value).every(value => value.trim().length > 0))
-
-onMounted(() => {
-  form.value.endpoint = configStore.obsStatus.endpoint
-  form.value.bucket = configStore.obsStatus.bucket
-})
 
 function close(): void {
   if (canClose.value) emit('close')
@@ -24,16 +19,17 @@ function close(): void {
 async function save(): Promise<void> {
   if (!canSave.value) return
   saving.value = true
-  const connected = await configStore.configureOBS({ ...form.value })
+  const connected = await configStore.login({ ...form.value })
+  form.value.password = ''
   saving.value = false
 
   if (connected) {
-    uiStore.notify({ type: 'success', title: 'Conexión verificada y guardada' })
+    uiStore.notify({ type: 'success', title: 'Sesión iniciada' })
     emit('close')
   } else {
     uiStore.notify({
       type: 'error',
-      title: 'No se pudo conectar',
+      title: 'No se pudo iniciar sesión',
       message: configStore.connectionError ?? undefined,
       duration: 0
     })
@@ -46,40 +42,32 @@ async function save(): Promise<void> {
     <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <header class="modal-header">
         <div>
-          <p class="eyebrow">Conexión protegida</p>
-          <h2 id="settings-title">Huawei OBS</h2>
+          <p class="eyebrow">Acceso de operador</p>
+          <h2 id="settings-title">Cargar música</h2>
         </div>
         <button v-if="canClose" class="close-btn" aria-label="Cerrar" @click="close">×</button>
       </header>
 
-      <div v-if="configStore.obsStatus.configured" class="saved-connection">
+      <div v-if="configStore.hasOperatorSession" class="saved-connection">
         <span class="status-dot"></span>
         <div>
-          <strong>Hay una credencial guardada</strong>
-          <p>{{ configStore.obsStatus.accessKeyIdHint }} · {{ configStore.obsStatus.bucket }}</p>
+          <strong>Sesión activa</strong>
+          <p>{{ configStore.operator.displayName || configStore.operator.username }}</p>
         </div>
       </div>
 
       <div class="modal-content">
         <p class="intro">
-          Estos datos se guardan cifrados por Windows. Para cambiar la conexión, completá los cuatro campos.
+          Entrá con el usuario de carga que te asignaron. La aplicación nunca te pide claves de Huawei OBS.
         </p>
 
         <label>
-          <span>Access Key ID</span>
-          <input v-model="form.accessKeyId" class="input" autocomplete="off" />
+          <span>Usuario</span>
+          <input v-model="form.username" class="input" autocomplete="username" />
         </label>
         <label>
-          <span>Secret Access Key</span>
-          <input v-model="form.secretAccessKey" class="input" type="password" autocomplete="new-password" />
-        </label>
-        <label>
-          <span>Endpoint</span>
-          <input v-model="form.endpoint" class="input" placeholder="https://obs.region.myhuaweicloud.com" />
-        </label>
-        <label>
-          <span>Bucket</span>
-          <input v-model="form.bucket" class="input" />
+          <span>Contraseña</span>
+          <input v-model="form.password" class="input" type="password" autocomplete="current-password" />
         </label>
 
         <p v-if="configStore.connectionError" class="error-copy">{{ configStore.connectionError }}</p>
@@ -88,7 +76,7 @@ async function save(): Promise<void> {
       <footer class="modal-actions">
         <button v-if="canClose" class="btn btn-secondary" @click="close">Cancelar</button>
         <button class="btn btn-primary" :disabled="!canSave || saving" @click="save">
-          {{ saving ? 'Verificando…' : 'Verificar y guardar' }}
+          {{ saving ? 'Ingresando…' : 'Ingresar' }}
         </button>
       </footer>
     </section>

@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { OBSConfigInput, OBSConfigStatus } from '../../shared/contracts'
+import type { OperatorLogin, OperatorStatus } from '../../shared/contracts'
 import type { DestinationPrefix } from '../../shared/uploadPolicy'
 
 type Theme = 'light' | 'dark' | 'system'
@@ -9,18 +9,13 @@ export const useConfigStore = defineStore('config', () => {
   const localPath = ref('')
   const destination = ref<DestinationPrefix>('Music/online/Progressive/')
   const theme = ref<Theme>('system')
-  const obsStatus = ref<OBSConfigStatus>({
-    configured: false,
-    endpoint: '',
-    bucket: '',
-    accessKeyIdHint: ''
-  })
+  const operator = ref<OperatorStatus>({ configured: false, username: '', displayName: '', tenantId: null })
   const isConnected = ref(false)
   const connectionRevision = ref(0)
   const isLoading = ref(false)
   const connectionError = ref<string | null>(null)
 
-  const hasOBSConfig = computed(() => obsStatus.value.configured)
+  const hasOperatorSession = computed(() => operator.value.configured && isConnected.value)
   const effectiveTheme = computed<'light' | 'dark'>(() => {
     if (theme.value === 'system') {
       return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
@@ -39,13 +34,12 @@ export const useConfigStore = defineStore('config', () => {
       destination.value = await window.electronAPI.getPreference<DestinationPrefix>('destination')
         ?? 'Music/online/Progressive/'
       theme.value = await window.electronAPI.getPreference<Theme>('theme') ?? 'system'
-      obsStatus.value = await window.electronAPI.getOBSStatus()
       applyTheme()
-
-      if (obsStatus.value.configured) {
-        isConnected.value = await window.electronAPI.obsConnectStored()
-        if (isConnected.value) connectionRevision.value += 1
-        if (!isConnected.value) connectionError.value = 'No se pudo conectar con la credencial guardada'
+      const restored = await window.electronAPI.operatorConnectStored()
+      if (restored) {
+        operator.value = restored
+        isConnected.value = true
+        connectionRevision.value += 1
       }
     } catch (error) {
       connectionError.value = (error as Error).message
@@ -54,25 +48,30 @@ export const useConfigStore = defineStore('config', () => {
     }
   }
 
-  async function configureOBS(config: OBSConfigInput): Promise<boolean> {
+  async function login(credentials: OperatorLogin): Promise<boolean> {
     isLoading.value = true
     connectionError.value = null
     try {
-      const connected = await window.electronAPI.obsConfigure(config)
-      isConnected.value = connected
-      if (connected) {
-        connectionRevision.value += 1
-        obsStatus.value = await window.electronAPI.getOBSStatus()
-      } else {
-        connectionError.value = 'La credencial o los datos del bucket fueron rechazados'
-      }
-      return connected
+      operator.value = await window.electronAPI.operatorLogin(credentials)
+      isConnected.value = true
+      connectionRevision.value += 1
+      return true
     } catch (error) {
       connectionError.value = (error as Error).message
       isConnected.value = false
       return false
     } finally {
       isLoading.value = false
+    }
+  }
+
+  async function logout(): Promise<void> {
+    try {
+      await window.electronAPI.operatorLogout()
+    } finally {
+      operator.value = { configured: false, username: '', displayName: '', tenantId: null }
+      isConnected.value = false
+      connectionRevision.value += 1
     }
   }
 
@@ -96,22 +95,7 @@ export const useConfigStore = defineStore('config', () => {
     if (theme.value === 'system') applyTheme()
   })
 
-  return {
-    localPath,
-    destination,
-    theme,
-    obsStatus,
-    isConnected,
-    connectionRevision,
-    isLoading,
-    connectionError,
-    hasOBSConfig,
-    effectiveTheme,
-    loadConfig,
-    configureOBS,
-    saveLocalPath,
-    saveDestination,
-    saveTheme,
-    applyTheme
-  }
+  return { localPath, destination, theme, operator, isConnected, connectionRevision,
+    isLoading, connectionError, hasOperatorSession, effectiveTheme, loadConfig,
+    login, logout, saveLocalPath, saveDestination, saveTheme, applyTheme }
 })

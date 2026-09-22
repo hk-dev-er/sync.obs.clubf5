@@ -104,8 +104,8 @@ async function loadMusicFolders(): Promise<void> {
     if (folders.length === 0) {
       uiStore.notify({
         type: 'error',
-        title: 'No hay carpetas musicales disponibles',
-        message: `OBS no devolvió carpetas existentes dentro de ${MUSIC_ROOT}.`,
+        title: 'No tenés carpetas asignadas',
+        message: `Pedile al administrador acceso a una carpeta dentro de ${MUSIC_ROOT}.`,
         duration: 0
       })
       return
@@ -115,7 +115,7 @@ async function loadMusicFolders(): Promise<void> {
       uiStore.notify({
         type: 'warning',
         title: 'Elegí la carpeta de destino',
-        message: 'La carpeta guardada ya no está disponible en OBS.'
+        message: 'La carpeta guardada ya no está asignada a tu cuenta.'
       })
     }
   } catch (error) {
