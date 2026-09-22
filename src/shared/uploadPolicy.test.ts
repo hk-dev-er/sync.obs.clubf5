@@ -43,6 +43,8 @@ describe('upload policy', () => {
 
   it('rechaza traversal y extensiones distintas de OGG', () => {
     expect(() => normalizeRelativePath('../track.ogg')).toThrow(/inválida/)
+    expect(() => normalizeRelativePath('100% música.ogg')).toThrow(/inválida/)
+    expect(() => normalizeRelativePath('carpeta//tema.ogg')).toThrow(/inválida/)
     expect(() => buildObjectKey('Music/online/Progressive/', 'track.mp3')).toThrow(/Solo se permiten/)
   })
 

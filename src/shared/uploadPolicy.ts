@@ -42,8 +42,10 @@ export function normalizeRelativePath(value: string): string {
   const normalized = value.replace(/\\/g, '/').normalize('NFC')
   const segments = normalized.split('/').filter(Boolean)
 
-  if (segments.length === 0 || segments.some(segment => segment === '.' || segment === '..')) {
-    throw new Error('Ruta relativa inválida')
+  if (segments.length === 0 || normalized !== segments.join('/')
+    || segments.some(segment => segment === '.' || segment === '..'
+      || segment.trim() !== segment || /[\u0000-\u001f\u007f%:*?#]/.test(segment))) {
+    throw new Error('Ruta relativa inválida para ClubF5')
   }
 
   return segments.join('/')
