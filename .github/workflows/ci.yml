@@ -23,6 +23,16 @@ jobs:
       - run: pnpm test
       - run: pnpm typecheck
       - run: pnpm exec vite build
+      - name: Crear instalador y versión portable Windows sin publicar
+        run: pnpm exec electron-builder --win --x64 --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Comprobar ambos ejecutables
+        shell: pwsh
+        run: |
+          if (@(Get-ChildItem -Path release -File -Filter *.exe).Count -lt 2) {
+            throw 'Faltan el instalador o la versión portable Windows'
+          }
 
   verify-macos:
     runs-on: macos-latest
