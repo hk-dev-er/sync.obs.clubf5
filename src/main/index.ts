@@ -1,9 +1,10 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
+import { writeFile } from 'fs/promises'
 import { fileSystemHandlers } from './fileSystem'
-import { watchHandlers } from './watchService'
 import { configHandlers } from './configService'
 import { obsHandlers } from './obsService'
+import type { UploadReport } from '../shared/contracts'
 
 // Prevent multiple instances
 const gotTheLock = app.requestSingleInstanceLock()
@@ -25,7 +26,7 @@ function createWindow() {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     },
     icon: join(__dirname, '../../public/icon.png')
   })
@@ -50,11 +51,6 @@ function registerHandlers() {
     ipcMain.handle(channel, handler)
   })
 
-  // Watch handlers
-  Object.entries(watchHandlers).forEach(([channel, handler]) => {
-    ipcMain.handle(channel, handler)
-  })
-
   // Config handlers
   Object.entries(configHandlers).forEach(([channel, handler]) => {
     ipcMain.handle(channel, handler)
@@ -73,24 +69,19 @@ function registerHandlers() {
     return result.canceled ? null : result.filePaths[0]
   })
 
-  ipcMain.handle('dialog:selectFile', async (_event, filters?: { name: string; extensions: string[] }[]) => {
-    const result = await dialog.showOpenDialog({
-      properties: ['openFile'],
-      filters: filters || []
+  ipcMain.handle('report:save', async (_event, report: UploadReport) => {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    const result = await dialog.showSaveDialog({
+      defaultPath: `informe-carga-clubf5-${stamp}.json`,
+      filters: [{ name: 'Informe JSON', extensions: ['json'] }]
     })
-    return result.canceled ? null : result.filePaths[0]
-  })
-
-  ipcMain.handle('dialog:selectFiles', async () => {
-    const result = await dialog.showOpenDialog({
-      properties: ['openFile', 'multiSelections']
-    })
-    return result.canceled ? [] : result.filePaths
+    if (result.canceled || !result.filePath) return null
+    await writeFile(result.filePath, JSON.stringify(report, null, 2), 'utf8')
+    return result.filePath
   })
 
   // App handlers
   ipcMain.handle('app:getVersion', () => app.getVersion())
-  ipcMain.handle('app:openExternal', (_event, url: string) => shell.openExternal(url))
 
   // Window controls
   ipcMain.on('window:minimize', () => mainWindow?.minimize())
@@ -129,8 +120,3 @@ app.on('second-instance', () => {
     mainWindow.focus()
   }
 })
-
-// Export for watch service to send events
-export function sendToRenderer(channel: string, ...args: unknown[]) {
-  mainWindow?.webContents.send(channel, ...args)
-}

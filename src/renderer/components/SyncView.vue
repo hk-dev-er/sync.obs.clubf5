@@ -1,537 +1,508 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useConfigStore } from '../stores/configStore'
 import { useUIStore } from '../stores/uiStore'
-import { syncService, type SyncMode, type SyncResult } from '../services/syncService'
-import { obsService, type OBSObject } from '../services/obsService'
+import type {
+  LocalScanResult,
+  ScanProgress,
+  UploadProgress,
+  UploadReport,
+  UploadReportEntry
+} from '../../shared/contracts'
+import {
+  buildUploadPlan,
+  normalizeEtag,
+  type UploadPlan,
+  type UploadPlanItem
+} from '../../shared/syncPlan'
+import { ALLOWED_DESTINATIONS, type DestinationPrefix } from '../../shared/uploadPolicy'
 
 const configStore = useConfigStore()
 const uiStore = useUIStore()
 
-const step = ref<'config' | 'preview' | 'progress' | 'complete'>('config')
+const analyzing = ref(false)
+const uploading = ref(false)
+const confirming = ref(false)
+const scanProgress = ref<ScanProgress>({ processed: 0, total: 0, currentFile: '' })
+const scanResult = ref<LocalScanResult | null>(null)
+const plan = ref<UploadPlan | null>(null)
+const report = ref<UploadReport | null>(null)
+const currentFile = ref('')
+const currentTransferId = ref('')
+const completedBytes = ref(0)
+const currentTransferred = ref(0)
+const uploadStartedAt = ref(0)
+const uploadTotalBytes = ref(0)
 
-const syncMode = ref<SyncMode>('local-to-obs')
-const localPath = ref('')
-const remotePath = ref('')
-const syncResult = ref<SyncResult | null>(null)
-const selectedItems = ref<Set<string>>(new Set())
-const isLoading = ref(false)
-const progress = ref({ current: 0, total: 0, currentFile: '', percentage: 0 })
-const executionResult = ref<{ success: number; failed: number; errors: string[] } | null>(null)
+let unsubscribeScan: (() => void) | null = null
+let unsubscribeUpload: (() => void) | null = null
 
-const showObsBrowser = ref(false)
-const obsBrowserPrefix = ref('')
-const obsBrowserItems = ref<OBSObject[]>([])
-const obsBrowserLoading = ref(false)
+const newItems = computed(() => plan.value?.items.filter(item => item.kind === 'upload-new') ?? [])
+const conflicts = computed(() => plan.value?.items.filter(item => item.kind === 'conflict') ?? [])
+const replacements = computed(() => conflicts.value.filter(item => item.decision === 'replace'))
+const uploads = computed(() => newItems.value.filter(item => item.decision === 'upload'))
+const actionItems = computed(() => [...uploads.value, ...replacements.value])
+const progressBytes = computed(() => Math.min(uploadTotalBytes.value, completedBytes.value + currentTransferred.value))
+const progressPercent = computed(() => uploadTotalBytes.value === 0
+  ? 0
+  : Math.round((progressBytes.value / uploadTotalBytes.value) * 100))
+const speed = computed(() => {
+  const seconds = (Date.now() - uploadStartedAt.value) / 1000
+  return seconds > 0 ? progressBytes.value / seconds : 0
+})
+const eta = computed(() => speed.value > 0 ? (uploadTotalBytes.value - progressBytes.value) / speed.value : 0)
 
 onMounted(() => {
-  localPath.value = configStore.config.localPath || ''
-  remotePath.value = configStore.config.remotePath || ''
+  unsubscribeScan = window.electronAPI.onScanProgress(progress => { scanProgress.value = progress })
+  unsubscribeUpload = window.electronAPI.onUploadProgress((progress: UploadProgress) => {
+    if (progress.transferId === currentTransferId.value) {
+      currentTransferred.value = progress.transferred
+    }
+  })
 })
 
-const canCompare = computed(() => Boolean(localPath.value && remotePath.value))
-
-const filteredItems = computed(() => {
-  if (!syncResult.value) return []
-  return syncResult.value.items.filter(item => item.action !== 'skip')
+onUnmounted(() => {
+  unsubscribeScan?.()
+  unsubscribeUpload?.()
 })
 
-async function selectLocalPath() {
-  const path = await window.electronAPI.selectFolder()
-  if (path) {
-    localPath.value = path
-    configStore.saveLocalPath(path)
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
+  return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`
+}
+
+function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return 'calculando…'
+  if (seconds < 60) return `${Math.ceil(seconds)} s`
+  return `${Math.ceil(seconds / 60)} min`
+}
+
+function destinationLabel(destination: DestinationPrefix): string {
+  return destination.includes('Melodic_Techno') ? 'Melodic Techno' : 'Progressive'
+}
+
+async function chooseFolder(): Promise<void> {
+  const selected = await window.electronAPI.selectFolder()
+  if (!selected) return
+  await configStore.saveLocalPath(selected)
+  resetAnalysis()
+}
+
+async function changeDestination(event: Event): Promise<void> {
+  const value = (event.target as HTMLSelectElement).value as DestinationPrefix
+  await configStore.saveDestination(value)
+  resetAnalysis()
+}
+
+function resetAnalysis(): void {
+  plan.value = null
+  scanResult.value = null
+  report.value = null
+  confirming.value = false
+}
+
+async function analyze(): Promise<void> {
+  if (!configStore.localPath || !configStore.isConnected) return
+  analyzing.value = true
+  report.value = null
+  plan.value = null
+  scanProgress.value = { processed: 0, total: 0, currentFile: '' }
+
+  try {
+    const [local, remote] = await Promise.all([
+      window.electronAPI.scanLocalAudio(configStore.localPath),
+      window.electronAPI.obsListAllObjects(configStore.destination)
+    ])
+    scanResult.value = local
+
+    const localByPath = new Map(local.files.map(file => [file.relativePath, file]))
+    for (const remoteFile of remote) {
+      const localFile = localByPath.get(remoteFile.relativePath)
+      if (localFile && localFile.size === remoteFile.size && !normalizeEtag(remoteFile.etag)) {
+        const metadata = await window.electronAPI.obsGetObjectMetadata(remoteFile.key)
+        remoteFile.sha256 = metadata?.sha256 ?? null
+      }
+    }
+
+    plan.value = buildUploadPlan(local.files, remote)
+    uiStore.notify({
+      type: 'success',
+      title: 'Comparación terminada',
+      message: `${local.files.length} audios locales revisados por contenido.`
+    })
+  } catch (error) {
+    uiStore.notify({ type: 'error', title: 'No se pudo comparar', message: (error as Error).message, duration: 0 })
+  } finally {
+    analyzing.value = false
   }
 }
 
-async function compare() {
-  if (!canCompare.value) return
+function setConflictDecision(item: UploadPlanItem, decision: 'keep' | 'replace'): void {
+  item.decision = decision
+}
 
-  isLoading.value = true
-  try {
-    syncResult.value = await syncService.compare(localPath.value, remotePath.value, syncMode.value)
+function setAllConflicts(decision: 'keep' | 'replace'): void {
+  for (const item of conflicts.value) item.decision = decision
+}
 
-    selectedItems.value = new Set(
-      syncResult.value.items
-        .filter(item => item.action !== 'skip')
-        .map(item => item.name)
-    )
+function requestConfirmation(): void {
+  if (actionItems.value.length === 0) return
+  confirming.value = true
+}
 
-    configStore.saveRemotePath(remotePath.value)
-    step.value = 'preview'
-  } catch (error) {
+async function validatePlayable(path: string): Promise<void> {
+  const url = await window.electronAPI.getFileUrl(path)
+  await new Promise<void>((resolve, reject) => {
+    const audio = new Audio()
+    const timer = window.setTimeout(() => {
+      audio.src = ''
+      reject(new Error('El audio no pudo validarse en 10 segundos'))
+    }, 10_000)
+
+    audio.preload = 'metadata'
+    audio.onloadedmetadata = () => {
+      window.clearTimeout(timer)
+      const valid = Number.isFinite(audio.duration) && audio.duration > 0
+      audio.src = ''
+      valid ? resolve() : reject(new Error('El audio no tiene una duración válida'))
+    }
+    audio.onerror = () => {
+      window.clearTimeout(timer)
+      audio.src = ''
+      reject(new Error('Chromium no pudo decodificar el archivo OGG'))
+    }
+    audio.src = url
+  })
+}
+
+function baseReportEntries(): UploadReportEntry[] {
+  if (!plan.value) return []
+  const entries: UploadReportEntry[] = (scanResult.value?.invalid ?? []).map(file => ({
+    relativePath: file.path,
+    action: 'invalid',
+    bytes: 0,
+    message: file.reason
+  }))
+  for (const item of plan.value.items) {
+    if (item.kind === 'identical') {
+      entries.push({ relativePath: item.relativePath, action: 'identical', bytes: item.local?.size ?? 0, message: item.reason })
+    }
+    if (item.kind === 'remote-only' || (item.kind === 'conflict' && item.decision === 'keep')) {
+      entries.push({ relativePath: item.relativePath, action: 'kept', bytes: item.remote?.size ?? 0, message: item.reason })
+    }
+  }
+  return entries
+}
+
+async function runUpload(items: UploadPlanItem[], seedEntries: UploadReportEntry[] = baseReportEntries()): Promise<void> {
+  if (items.length === 0) return
+  uploading.value = true
+  confirming.value = false
+  const entries = [...seedEntries]
+  uploadTotalBytes.value = items.reduce((sum, item) => sum + (item.local?.size ?? 0), 0)
+  completedBytes.value = 0
+  currentTransferred.value = 0
+  uploadStartedAt.value = Date.now()
+
+  for (const item of items) {
+    if (!item.local) continue
+    currentFile.value = item.relativePath
+    currentTransferred.value = 0
+    currentTransferId.value = crypto.randomUUID()
+
+    try {
+      await validatePlayable(item.local.path)
+      const result = await window.electronAPI.obsUploadFile({
+        transferId: currentTransferId.value,
+        localPath: item.local.path,
+        relativePath: item.relativePath,
+        destination: configStore.destination,
+        allowReplace: item.kind === 'conflict' && item.decision === 'replace',
+        expectedRemote: item.remote ? { size: item.remote.size, etag: item.remote.etag } : null,
+        digest: { size: item.local.size, md5: item.local.md5, sha256: item.local.sha256 }
+      })
+      entries.push({
+        relativePath: item.relativePath,
+        action: result.replaced ? 'replaced' : 'uploaded',
+        bytes: item.local.size,
+        message: result.replaced ? 'Reemplazado y verificado; el anterior quedó respaldado.' : 'Cargado y verificado.',
+        backupKey: result.backupKey
+      })
+    } catch (error) {
+      entries.push({
+        relativePath: item.relativePath,
+        action: 'failed',
+        bytes: item.local.size,
+        message: (error as Error).message
+      })
+    } finally {
+      completedBytes.value += item.local.size
+      currentTransferred.value = 0
+    }
+  }
+
+  currentFile.value = ''
+  currentTransferId.value = ''
+  uploading.value = false
+  report.value = makeReport(entries)
+
+  if (report.value.totals.failed > 0) {
     uiStore.notify({
       type: 'error',
-      title: 'Error al comparar',
-      message: (error as Error).message
+      title: `${report.value.totals.failed} archivo(s) no se cargaron`,
+      message: 'Los demás resultados están en el informe. Podés reintentar solo los fallidos.',
+      duration: 0
     })
-  } finally {
-    isLoading.value = false
-  }
-}
-
-function toggleItem(name: string) {
-  if (selectedItems.value.has(name)) {
-    selectedItems.value.delete(name)
   } else {
-    selectedItems.value.add(name)
+    uiStore.notify({ type: 'success', title: 'Carga terminada y verificada' })
   }
 }
 
-function selectAll() {
-  filteredItems.value.forEach(item => selectedItems.value.add(item.name))
-}
-
-function selectNone() {
-  selectedItems.value.clear()
-}
-
-async function executeSync() {
-  if (!syncResult.value) return
-
-  const itemsToSync = syncResult.value.items.filter(
-    item => selectedItems.value.has(item.name)
-  )
-
-  if (itemsToSync.length === 0) {
-    uiStore.notify({ type: 'warning', title: 'No hay elementos seleccionados' })
-    return
-  }
-
-  step.value = 'progress'
-
-  try {
-    executionResult.value = await syncService.execute(itemsToSync, (prog) => {
-      progress.value = prog
-    })
-    step.value = 'complete'
-  } catch (error) {
-    uiStore.notify({
-      type: 'error',
-      title: 'Error durante la sincronización',
-      message: (error as Error).message
-    })
-    step.value = 'preview'
+function makeReport(entries: UploadReportEntry[]): UploadReport {
+  const count = (action: UploadReportEntry['action']) => entries.filter(entry => entry.action === action).length
+  return {
+    generatedAt: new Date().toISOString(),
+    sourceFolder: configStore.localPath,
+    destination: configStore.destination,
+    totals: {
+      uploaded: count('uploaded'),
+      replaced: count('replaced'),
+      kept: count('kept'),
+      identical: count('identical'),
+      invalid: count('invalid'),
+      failed: count('failed')
+    },
+    entries
   }
 }
 
-async function openObsBrowser() {
-  showObsBrowser.value = true
-  obsBrowserPrefix.value = remotePath.value || ''
-  await loadObsBrowser(obsBrowserPrefix.value)
+async function saveReport(): Promise<void> {
+  if (!report.value) return
+  const plainReport = JSON.parse(JSON.stringify(report.value)) as UploadReport
+  const path = await window.electronAPI.saveReport(plainReport)
+  if (path) uiStore.notify({ type: 'success', title: 'Informe guardado', message: path })
 }
 
-async function loadObsBrowser(prefix: string) {
-  obsBrowserLoading.value = true
-  try {
-    obsBrowserItems.value = await obsService.listObjects(prefix)
-  } catch (error) {
-    uiStore.notify({
-      type: 'error',
-      title: 'Error al explorar OBS',
-      message: (error as Error).message
-    })
-    obsBrowserItems.value = []
-  } finally {
-    obsBrowserLoading.value = false
-  }
-}
-
-async function navigateObs(prefix: string) {
-  obsBrowserPrefix.value = prefix
-  await loadObsBrowser(prefix)
-}
-
-async function goObsUp() {
-  const prefix = obsBrowserPrefix.value
-  if (!prefix) return
-  const trimmed = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
-  const idx = trimmed.lastIndexOf('/')
-  const parent = idx < 0 ? '' : trimmed.slice(0, idx + 1)
-  obsBrowserPrefix.value = parent
-  await loadObsBrowser(parent)
-}
-
-function selectObsPrefix(prefix: string) {
-  remotePath.value = prefix
-  showObsBrowser.value = false
-}
-
-function closeObsBrowser() {
-  showObsBrowser.value = false
-}
-
-function getActionIcon(action: string): string {
-  switch (action) {
-    case 'upload': return '⬆️'
-    case 'download': return '⬇️'
-    case 'delete-local': return '🗑️'
-    case 'delete-remote': return '☁️🗑️'
-    default: return '⏭️'
-  }
-}
-
-function getActionLabel(action: string): string {
-  switch (action) {
-    case 'upload': return 'Subir'
-    case 'download': return 'Descargar'
-    case 'delete-local': return 'Eliminar local'
-    case 'delete-remote': return 'Eliminar remoto'
-    default: return 'Omitir'
-  }
-}
-
-function backToConfig() {
-  step.value = 'config'
-  syncResult.value = null
-  executionResult.value = null
-}
-
-function reset() {
-  step.value = 'config'
-  syncResult.value = null
-  executionResult.value = null
-  selectedItems.value = new Set()
+async function retryFailed(): Promise<void> {
+  if (!report.value || !plan.value) return
+  const failed = new Set(report.value.entries.filter(entry => entry.action === 'failed').map(entry => entry.relativePath))
+  const retained = report.value.entries.filter(entry => entry.action !== 'failed')
+  await runUpload(actionItems.value.filter(item => failed.has(item.relativePath)), retained)
 }
 </script>
 
 <template>
-  <div class="sync-view">
-    <!-- Config Step -->
-    <div v-if="step === 'config'" class="sync-card">
-      <div class="sync-card-header">
-        <h2 class="sync-card-title">Sincronizar</h2>
-        <p class="sync-card-subtitle">Compara y sincroniza una carpeta local con OBS de forma recursiva.</p>
+  <main class="uploader-shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Carga segura a Huawei OBS</p>
+        <h1>Actualizar música</h1>
+        <p>La aplicación compara el contenido exacto y nunca borra archivos de OBS.</p>
       </div>
+      <span class="direction-pill">PC → OBS</span>
+    </section>
 
-      <div class="form-group">
-        <label class="form-label">Carpeta local</label>
-        <div class="flex gap-2">
-          <input v-model="localPath" type="text" class="input flex-1" placeholder="Selecciona una carpeta..." />
-          <button @click="selectLocalPath" class="btn btn-secondary">Examinar</button>
+    <section class="setup-panel">
+      <div class="field source-field">
+        <label>Carpeta de la computadora</label>
+        <div class="path-row">
+          <span :class="{ placeholder: !configStore.localPath }">
+            {{ configStore.localPath || 'Elegí la carpeta que contiene los audios OGG' }}
+          </span>
+          <button class="btn btn-secondary" :disabled="uploading" @click="chooseFolder">Elegir carpeta</button>
         </div>
       </div>
 
-      <div class="form-group">
-        <label class="form-label">Prefijo remoto (OBS)</label>
-        <div class="flex gap-2">
-          <input v-model="remotePath" type="text" class="input flex-1" placeholder="carpeta/subcarpeta/" />
-          <button @click="openObsBrowser" class="btn btn-secondary">Examinar</button>
-        </div>
+      <div class="field">
+        <label for="destination">Carpeta de destino</label>
+        <select id="destination" class="input" :value="configStore.destination" :disabled="uploading" @change="changeDestination">
+          <option v-for="destination in ALLOWED_DESTINATIONS" :key="destination" :value="destination">
+            {{ destinationLabel(destination) }}
+          </option>
+        </select>
       </div>
 
-      <div class="form-group">
-        <label class="form-label">Modo de sincronización</label>
-        <div class="sync-modes">
-          <button @click="syncMode = 'local-to-obs'" :class="['mode-btn', { active: syncMode === 'local-to-obs' }]">
-            <span class="mode-icon">💻 → ☁️</span>
-            <span class="mode-label">Local → OBS</span>
-            <span class="mode-desc">Subir cambios locales</span>
-          </button>
-          <button @click="syncMode = 'obs-to-local'" :class="['mode-btn', { active: syncMode === 'obs-to-local' }]">
-            <span class="mode-icon">☁️ → 💻</span>
-            <span class="mode-label">OBS → Local</span>
-            <span class="mode-desc">Descargar cambios remotos</span>
-          </button>
-          <button @click="syncMode = 'bidirectional'" :class="['mode-btn', { active: syncMode === 'bidirectional' }]">
-            <span class="mode-icon">💻 ↔ ☁️</span>
-            <span class="mode-label">Bidireccional</span>
-            <span class="mode-desc">Sincronizar ambos</span>
-          </button>
-        </div>
-      </div>
+      <button
+        class="btn btn-primary analyze-btn"
+        :disabled="!configStore.localPath || !configStore.isConnected || analyzing || uploading"
+        @click="analyze"
+      >
+        {{ analyzing ? 'Comparando contenido…' : 'Comparar antes de cargar' }}
+      </button>
+    </section>
 
-      <div class="form-actions">
-        <button @click="compare" :disabled="!canCompare || isLoading" class="btn btn-primary">
-          {{ isLoading ? 'Comparando...' : 'Comparar' }}
-        </button>
+    <div v-if="analyzing" class="progress-card">
+      <div class="progress-copy">
+        <strong>Calculando huellas exactas</strong>
+        <span>{{ scanProgress.processed }} de {{ scanProgress.total || '…' }}</span>
       </div>
+      <p>{{ scanProgress.currentFile || 'Consultando OBS…' }}</p>
+      <div class="progress-track"><div :style="{ width: `${scanProgress.total ? (scanProgress.processed / scanProgress.total) * 100 : 8}%` }"></div></div>
     </div>
 
-    <!-- Preview Step -->
-    <div v-if="step === 'preview'" class="sync-card">
-      <div class="sync-card-header">
-        <h2 class="sync-card-title">Cambios detectados</h2>
-        <p class="sync-card-subtitle">
-          <span class="mono">{{ localPath }}</span>
-          <span class="mx-1">↔</span>
-          <span class="mono">{{ remotePath }}</span>
+    <template v-if="plan && !uploading">
+      <section class="summary-grid">
+        <article><strong>{{ plan.counts.newFiles }}</strong><span>Nuevos</span><small>Listos para cargar</small></article>
+        <article><strong>{{ plan.counts.identical }}</strong><span>Idénticos</span><small>No se vuelven a cargar</small></article>
+        <article class="warning"><strong>{{ plan.counts.conflicts }}</strong><span>Coincidencias de nombre</span><small>Requieren una decisión</small></article>
+        <article><strong>{{ plan.counts.remoteOnly }}</strong><span>Solo en OBS</span><small>Se conservan</small></article>
+      </section>
+
+      <p v-if="scanResult?.invalid.length" class="validation-warning">
+        {{ scanResult.invalid.length }} archivo(s) OGG inválidos quedaron fuera de la carga.
+      </p>
+      <p v-if="scanResult?.ignored.length" class="muted-copy">
+        {{ scanResult.ignored.length }} archivo(s) que no son OGG fueron ignorados.
+      </p>
+
+      <section v-if="conflicts.length" class="conflicts-panel">
+        <header>
+          <div>
+            <p class="eyebrow">Revisión manual</p>
+            <h2>Mismo nombre, contenido distinto</h2>
+            <p>Por seguridad se conserva el archivo de OBS hasta que elijas reemplazarlo.</p>
+          </div>
+          <div class="bulk-actions">
+            <button class="btn btn-secondary" @click="setAllConflicts('keep')">Conservar todos</button>
+            <button class="btn btn-outline-warning" @click="setAllConflicts('replace')">Reemplazar todos</button>
+          </div>
+        </header>
+
+        <div class="conflict-list">
+          <article v-for="item in conflicts" :key="item.id" class="conflict-row">
+            <div class="file-copy">
+              <strong>{{ item.relativePath }}</strong>
+              <span>PC {{ formatBytes(item.local?.size ?? 0) }} · OBS {{ formatBytes(item.remote?.size ?? 0) }}</span>
+            </div>
+            <div class="decision-buttons">
+              <button :class="['decision', { active: item.decision === 'keep' }]" @click="setConflictDecision(item, 'keep')">Conservar OBS</button>
+              <button :class="['decision replace', { active: item.decision === 'replace' }]" @click="setConflictDecision(item, 'replace')">Reemplazar</button>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="action-bar">
+        <div>
+          <strong>{{ uploads.length }} nuevos · {{ replacements.length }} reemplazos</strong>
+          <p>{{ plan.counts.identical + plan.counts.remoteOnly + conflicts.length - replacements.length }} archivos quedan sin cambios.</p>
+        </div>
+        <button class="btn btn-primary" :disabled="actionItems.length === 0" @click="requestConfirmation">Revisar carga</button>
+      </section>
+
+      <section v-if="confirming" class="confirmation-panel">
+        <div>
+          <p class="eyebrow">Confirmación final</p>
+          <h2>Se cargarán {{ uploads.length }} archivos nuevos y se reemplazarán {{ replacements.length }}.</h2>
+          <p v-if="replacements.length">Cada reemplazo guarda primero una copia del archivo anterior.</p>
+          <p>Ningún archivo remoto será eliminado.</p>
+        </div>
+        <div class="confirmation-actions">
+          <button class="btn btn-secondary" @click="confirming = false">Volver</button>
+          <button class="btn btn-primary" @click="runUpload([...actionItems])">Confirmar carga</button>
+        </div>
+      </section>
+    </template>
+
+    <section v-if="uploading" class="upload-panel">
+      <div class="upload-heading">
+        <div><p class="eyebrow">Cargando y verificando</p><h2>{{ currentFile }}</h2></div>
+        <strong>{{ progressPercent }}%</strong>
+      </div>
+      <div class="progress-track large"><div :style="{ width: `${progressPercent}%` }"></div></div>
+      <div class="upload-metrics">
+        <span>{{ formatBytes(progressBytes) }} / {{ formatBytes(uploadTotalBytes) }}</span>
+        <span>{{ formatBytes(speed) }}/s</span>
+        <span>Restante: {{ formatEta(eta) }}</span>
+      </div>
+    </section>
+
+    <section v-if="report && !uploading" class="report-panel">
+      <header>
+        <div><p class="eyebrow">Resultado</p><h2>Carga finalizada</h2></div>
+        <div class="report-actions">
+          <button class="btn btn-secondary" @click="saveReport">Guardar informe</button>
+          <button v-if="report.totals.failed" class="btn btn-primary" @click="retryFailed">Reintentar fallidos</button>
+        </div>
+      </header>
+      <div class="report-totals">
+        <span>{{ report.totals.uploaded }} cargados</span>
+        <span>{{ report.totals.replaced }} reemplazados</span>
+        <span>{{ report.totals.identical }} idénticos</span>
+        <span>{{ report.totals.kept }} conservados</span>
+        <span :class="{ failed: report.totals.invalid }">{{ report.totals.invalid }} inválidos</span>
+        <span :class="{ failed: report.totals.failed }">{{ report.totals.failed }} fallidos</span>
+      </div>
+      <details v-if="report.totals.failed || report.totals.invalid">
+        <summary>Ver problemas</summary>
+        <p v-for="entry in report.entries.filter(item => item.action === 'failed' || item.action === 'invalid')" :key="entry.relativePath">
+          <strong>{{ entry.relativePath }}</strong> — {{ entry.message }}
         </p>
-      </div>
-
-      <div v-if="syncResult" class="preview-stats">
-        <span class="stat">⬆️ {{ syncResult.stats.toUpload }} subir</span>
-        <span class="stat">⬇️ {{ syncResult.stats.toDownload }} descargar</span>
-        <span class="stat">🗑️ {{ syncResult.stats.toDeleteLocal + syncResult.stats.toDeleteRemote }} eliminar</span>
-        <span class="stat">⏭️ {{ syncResult.stats.unchanged }} sin cambios</span>
-      </div>
-
-      <div class="preview-actions">
-        <button @click="selectAll" class="text-btn">Seleccionar todo</button>
-        <button @click="selectNone" class="text-btn">Deseleccionar</button>
-      </div>
-
-      <div class="preview-list">
-        <div v-for="item in filteredItems" :key="item.name" class="preview-item">
-          <input type="checkbox" :checked="selectedItems.has(item.name)" @change="toggleItem(item.name)" class="checkbox" />
-          <span class="item-icon">{{ getActionIcon(item.action) }}</span>
-          <span class="item-name" :title="item.name">{{ item.name }}</span>
-          <span class="item-action">{{ getActionLabel(item.action) }}</span>
-          <span class="item-reason">{{ item.reason }}</span>
-        </div>
-
-        <p v-if="filteredItems.length === 0" class="text-center text-gray-500 py-4">
-          No hay cambios pendientes
-        </p>
-      </div>
-
-      <div class="form-actions">
-        <button @click="backToConfig" class="btn btn-secondary">Atrás</button>
-        <button @click="executeSync" :disabled="selectedItems.size === 0" class="btn btn-primary">
-          Sincronizar ({{ selectedItems.size }})
-        </button>
-      </div>
-    </div>
-
-    <!-- Progress Step -->
-    <div v-if="step === 'progress'" class="sync-card sync-centered">
-      <svg class="animate-spin w-12 h-12 text-primary-500 mx-auto" fill="none" viewBox="0 0 24 24">
-        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
-      </svg>
-      <p class="sync-center-title">Sincronizando...</p>
-      <p class="progress-file">{{ progress.currentFile }}</p>
-      <div class="progress-bar">
-        <div class="progress-fill" :style="{ width: `${progress.percentage}%` }"></div>
-      </div>
-      <p class="progress-text">{{ progress.current }} / {{ progress.total }}</p>
-    </div>
-
-    <!-- Complete Step -->
-    <div v-if="step === 'complete'" class="sync-card sync-centered">
-      <div v-if="executionResult" class="complete-info">
-        <div class="complete-icon">✅</div>
-        <p class="sync-center-title">Sincronización completada</p>
-        <div class="complete-stats">
-          <span class="complete-stat success">✓ {{ executionResult.success }} exitosos</span>
-          <span v-if="executionResult.failed > 0" class="complete-stat error">✕ {{ executionResult.failed }} fallidos</span>
-        </div>
-
-        <div v-if="executionResult.errors.length > 0" class="error-list">
-          <p class="error-title">Errores:</p>
-          <ul>
-            <li v-for="(error, i) in executionResult.errors" :key="i">{{ error }}</li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="form-actions">
-        <button @click="reset" class="btn btn-primary">Nueva sincronización</button>
-      </div>
-    </div>
-
-    <!-- OBS Browser Modal -->
-    <div v-if="showObsBrowser" class="obs-browser-overlay" @click.self="closeObsBrowser">
-      <div class="obs-browser-modal">
-        <div class="modal-header">
-          <h2 class="modal-title">Examinar OBS</h2>
-          <button @click="closeObsBrowser" class="close-btn">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        <div class="modal-content">
-          <div class="obs-browser-path">
-            <button class="text-btn" :disabled="!obsBrowserPrefix" @click="goObsUp">⬆ Subir</button>
-            <button class="text-btn" :disabled="!obsBrowserPrefix" @click="selectObsPrefix('')">⏮ Raíz</button>
-            <span class="obs-browser-current">{{ obsBrowserPrefix || '/' }}</span>
-          </div>
-
-          <div class="obs-browser-list">
-            <p v-if="obsBrowserLoading" class="text-center text-gray-500 py-4">Cargando...</p>
-            <template v-else>
-              <button v-for="item in obsBrowserItems" :key="item.key" class="obs-browser-item" :disabled="!item.isDirectory" @click="item.isDirectory ? navigateObs(item.key) : undefined">
-                <span class="item-icon">{{ item.isDirectory ? '📁' : '📄' }}</span>
-                <span class="item-name">{{ item.name }}</span>
-                <span v-if="item.isDirectory" class="obs-browser-select">&gt;</span>
-              </button>
-              <p v-if="obsBrowserItems.length === 0" class="text-center text-gray-500 py-4">
-                Esta carpeta está vacía
-              </p>
-            </template>
-          </div>
-
-          <div class="form-actions">
-            <button @click="closeObsBrowser" class="btn btn-secondary">Cancelar</button>
-            <button @click="selectObsPrefix(obsBrowserPrefix)" class="btn btn-primary">Usar esta carpeta</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
+      </details>
+    </section>
+  </main>
 </template>
 
 <style scoped>
-.sync-view {
-  @apply p-4 overflow-y-auto;
-}
-.sync-card {
-  @apply bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 p-4 space-y-4 max-w-2xl mx-auto;
-}
-.sync-card-header {
-  @apply space-y-0.5;
-}
-.sync-card-title {
-  @apply text-lg font-semibold text-gray-800 dark:text-white;
-}
-.sync-card-subtitle {
-  @apply text-sm text-gray-500 dark:text-gray-400 break-all;
-}
-.mono {
-  @apply font-mono text-xs;
-}
-.sync-centered {
-  @apply flex flex-col items-center justify-center py-8 text-center;
-}
-.sync-center-title {
-  @apply text-lg font-medium text-gray-700 dark:text-gray-200;
-}
-.form-group {
-  @apply space-y-1.5;
-}
-.form-label {
-  @apply block text-sm font-medium text-gray-700 dark:text-gray-200;
-}
-.form-actions {
-  @apply flex gap-2 justify-end pt-4;
-}
-.sync-modes {
-  @apply grid grid-cols-3 gap-2;
-}
-.mode-btn {
-  @apply flex flex-col items-center p-3 border border-gray-300 dark:border-gray-600 rounded-lg;
-  @apply hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors;
-}
-.mode-btn.active {
-  @apply border-primary-500 bg-primary-50 dark:bg-primary-900/30;
-}
-.mode-icon {
-  @apply text-2xl mb-1;
-}
-.mode-label {
-  @apply text-sm font-medium text-gray-700 dark:text-gray-200;
-}
-.mode-desc {
-  @apply text-xs text-gray-500 dark:text-gray-400;
-}
-.preview-stats {
-  @apply flex gap-4 text-sm text-gray-600 dark:text-gray-400 flex-wrap;
-}
-.stat {
-  @apply flex items-center gap-1;
-}
-.preview-actions {
-  @apply flex gap-2;
-}
-.text-btn {
-  @apply text-sm text-primary-500 hover:text-primary-600 disabled:opacity-40 disabled:cursor-not-allowed;
-}
-.preview-list {
-  @apply max-h-96 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded;
-}
-.preview-item {
-  @apply flex items-center gap-2 px-3 py-2 text-sm border-b border-gray-100 dark:border-gray-700 last:border-0;
-}
-.checkbox {
-  @apply w-4 h-4 flex-shrink-0;
-}
-.item-icon {
-  @apply text-base flex-shrink-0;
-}
-.item-name {
-  @apply flex-1 truncate text-gray-700 dark:text-gray-200 min-w-0;
-}
-.item-action {
-  @apply text-xs px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-gray-600 dark:text-gray-400 flex-shrink-0;
-}
-.item-reason {
-  @apply text-xs text-gray-500 dark:text-gray-500 flex-shrink-0;
-}
-.progress-file {
-  @apply text-sm text-gray-500 dark:text-gray-400 truncate max-w-xs;
-}
-.progress-bar {
-  @apply w-full max-w-md h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden;
-}
-.progress-fill {
-  @apply h-full bg-primary-500 transition-all;
-}
-.progress-text {
-  @apply text-sm text-gray-500 dark:text-gray-400;
-}
-.complete-info {
-  @apply space-y-4;
-}
-.complete-icon {
-  @apply text-5xl;
-}
-.complete-stats {
-  @apply flex gap-4 justify-center;
-}
-.complete-stat {
-  @apply text-sm;
-}
-.complete-stat.success {
-  @apply text-green-600 dark:text-green-400;
-}
-.complete-stat.error {
-  @apply text-red-600 dark:text-red-400;
-}
-.error-list {
-  @apply mt-4 p-3 bg-red-50 dark:bg-red-900/20 rounded text-left max-h-32 overflow-y-auto w-full;
-}
-.error-title {
-  @apply text-sm font-medium text-red-700 dark:text-red-400 mb-1;
-}
-.error-list ul {
-  @apply list-disc list-inside text-xs text-red-600 dark:text-red-300;
-}
-.obs-browser-overlay {
-  @apply fixed inset-0 bg-black/50 flex items-center justify-center z-[60];
-}
-.obs-browser-modal {
-  @apply bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg max-h-[80vh] overflow-hidden;
-}
-.modal-header {
-  @apply flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700;
-}
-.modal-title {
-  @apply text-lg font-semibold text-gray-800 dark:text-white;
-}
-.close-btn {
-  @apply p-1 text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 rounded hover:bg-gray-100 dark:hover:bg-gray-700;
-}
-.modal-content {
-  @apply p-4 space-y-4;
-}
-.obs-browser-path {
-  @apply flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200;
-}
-.obs-browser-current {
-  @apply flex-1 truncate font-mono text-gray-500 dark:text-gray-400;
-}
-.obs-browser-list {
-  @apply max-h-64 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded;
-}
-.obs-browser-item {
-  @apply w-full flex items-center gap-2 px-3 py-2 text-sm text-left;
-  @apply border-b border-gray-100 dark:border-gray-700 last:border-0;
-  @apply hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors;
-  @apply disabled:opacity-50 disabled:cursor-default;
-}
-.obs-browser-select {
-  @apply ml-auto text-gray-400;
+.uploader-shell { @apply mx-auto h-full max-w-6xl space-y-5 overflow-y-auto p-6 pb-10; }
+.hero { @apply flex items-start justify-between; }
+.hero h1 { @apply text-3xl font-bold text-slate-950 dark:text-white; }
+.hero p:not(.eyebrow) { @apply mt-1 text-slate-600 dark:text-slate-400; }
+.eyebrow { @apply text-xs font-bold uppercase tracking-[0.16em] text-sky-600 dark:text-sky-400; }
+.direction-pill { @apply rounded-full border border-sky-300 bg-sky-50 px-4 py-2 text-sm font-semibold text-sky-700 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300; }
+.setup-panel { @apply grid grid-cols-[minmax(0,2fr)_minmax(220px,1fr)_auto] items-end gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800; }
+.field { @apply space-y-2; }
+.field label { @apply text-sm font-semibold text-slate-700 dark:text-slate-200; }
+.path-row { @apply flex min-h-10 items-center justify-between gap-3 rounded-lg border border-slate-300 bg-slate-50 pl-3 dark:border-slate-600 dark:bg-slate-900; }
+.path-row span { @apply truncate text-sm text-slate-700 dark:text-slate-200; }
+.path-row .placeholder { @apply text-slate-400; }
+.analyze-btn { @apply h-10 whitespace-nowrap px-5; }
+.progress-card, .upload-panel, .report-panel, .confirmation-panel { @apply rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800; }
+.progress-copy, .upload-heading { @apply flex items-center justify-between gap-4; }
+.progress-card p { @apply mt-2 truncate text-sm text-slate-500; }
+.progress-track { @apply mt-3 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700; }
+.progress-track div { @apply h-full rounded-full bg-sky-500 transition-all; }
+.summary-grid { @apply grid grid-cols-4 gap-3; }
+.summary-grid article { @apply flex flex-col rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800; }
+.summary-grid article.warning { @apply border-amber-300 dark:border-amber-800; }
+.summary-grid strong { @apply text-3xl text-slate-950 dark:text-white; }
+.summary-grid span { @apply mt-1 font-semibold; }
+.summary-grid small { @apply mt-1 text-slate-500; }
+.validation-warning { @apply rounded-xl border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200; }
+.muted-copy { @apply text-sm text-slate-500; }
+.conflicts-panel { @apply overflow-hidden rounded-2xl border border-amber-300 bg-white dark:border-amber-800 dark:bg-slate-800; }
+.conflicts-panel > header { @apply flex items-start justify-between gap-6 border-b border-amber-200 bg-amber-50 p-5 dark:border-amber-900 dark:bg-amber-950/30; }
+.conflicts-panel h2, .confirmation-panel h2, .upload-panel h2, .report-panel h2 { @apply text-xl font-semibold text-slate-950 dark:text-white; }
+.conflicts-panel header p:not(.eyebrow), .confirmation-panel p { @apply mt-1 text-sm text-slate-600 dark:text-slate-400; }
+.bulk-actions { @apply flex shrink-0 gap-2; }
+.btn-outline-warning { @apply border border-amber-500 text-amber-800 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-950; }
+.conflict-list { @apply max-h-80 divide-y divide-slate-200 overflow-y-auto dark:divide-slate-700; }
+.conflict-row { @apply flex items-center justify-between gap-4 p-4; }
+.file-copy { @apply min-w-0; }
+.file-copy strong { @apply block truncate; }
+.file-copy span { @apply mt-1 block text-xs text-slate-500; }
+.decision-buttons { @apply flex shrink-0 rounded-lg bg-slate-100 p-1 dark:bg-slate-900; }
+.decision { @apply rounded-md px-3 py-1.5 text-sm text-slate-500; }
+.decision.active { @apply bg-white font-semibold text-emerald-700 shadow-sm dark:bg-slate-700 dark:text-emerald-300; }
+.decision.replace.active { @apply text-amber-700 dark:text-amber-300; }
+.action-bar { @apply flex items-center justify-between rounded-2xl bg-slate-950 p-5 text-white dark:bg-sky-950; }
+.action-bar p { @apply mt-1 text-sm text-slate-400; }
+.confirmation-panel { @apply flex items-center justify-between gap-5 border-sky-400; }
+.confirmation-actions, .report-actions { @apply flex shrink-0 gap-3; }
+.upload-heading strong { @apply text-3xl text-sky-500; }
+.progress-track.large { @apply h-3; }
+.upload-metrics { @apply mt-3 flex justify-between text-sm text-slate-500; }
+.report-panel header { @apply flex items-center justify-between; }
+.report-totals { @apply mt-4 flex flex-wrap gap-2; }
+.report-totals span { @apply rounded-full bg-slate-100 px-3 py-1 text-sm dark:bg-slate-700; }
+.report-totals span.failed { @apply bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300; }
+.report-panel details { @apply mt-4 rounded-xl bg-red-50 p-4 text-sm text-red-800 dark:bg-red-950/40 dark:text-red-200; }
+.report-panel details p { @apply mt-2; }
+@media (max-width: 900px) {
+  .setup-panel { @apply grid-cols-1; }
+  .summary-grid { @apply grid-cols-2; }
+  .conflicts-panel > header, .conflict-row, .confirmation-panel { @apply flex-col items-stretch; }
 }
 </style>

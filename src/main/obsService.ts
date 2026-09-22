@@ -1,412 +1,264 @@
-// OBS Service for Main Process - Using Node.js SDK (no CORS issues)
+// Huawei OBS runs only in Electron's main process.
+// The SDK does not ship complete TypeScript declarations.
 // @ts-nocheck
 import ObsClient from 'esdk-obs-nodejs'
 import type { IpcMainInvokeEvent } from 'electron'
+import * as fs from 'fs/promises'
+import type {
+  OBSConfigInput,
+  RemoteObjectMetadata,
+  UploadProgress,
+  UploadRequest,
+  UploadResult
+} from '../shared/contracts'
+import type { RemoteAudioFile } from '../shared/syncPlan'
+import {
+  ALLOWED_DESTINATIONS,
+  buildBackupKey,
+  buildObjectKey,
+  isAllowedDestination
+} from '../shared/uploadPolicy'
+import { hashAndValidateOgg, validateLocalAudioPath } from './fileSystem'
+import { loadOBSConfig, saveOBSConfig } from './configService'
 
-export interface OBSConfig {
-  accessKeyId: string
-  secretAccessKey: string
-  endpoint: string
-  bucket: string
-}
+let obsClient: InstanceType<typeof ObsClient> | null = null
+let currentConfig: OBSConfigInput | null = null
 
-export interface OBSObject {
-  key: string
-  name: string
-  isDirectory: boolean
-  size: number
-  lastModified: string | null
-  etag?: string
-}
-
-let obsClient: typeof ObsClient | null = null
-let currentConfig: OBSConfig | null = null
-
-function initialize(config: OBSConfig): void {
-  if (!config || !config.endpoint) {
-    throw new Error('Endpoint OBS no configurado')
-  }
-  currentConfig = config
-  obsClient = new ObsClient({
+function createClient(config: OBSConfigInput): InstanceType<typeof ObsClient> {
+  return new ObsClient({
     access_key_id: config.accessKeyId,
     secret_access_key: config.secretAccessKey,
     server: config.endpoint
   })
 }
 
-function isInitialized(): boolean {
-  return obsClient !== null && currentConfig !== null
+function validateConfig(config: OBSConfigInput): void {
+  if (!config.accessKeyId.trim() || !config.secretAccessKey.trim() || !config.bucket.trim()) {
+    throw new Error('Completá Access Key, Secret Key y bucket')
+  }
+  const endpoint = new URL(config.endpoint)
+  if (endpoint.protocol !== 'https:') throw new Error('El endpoint OBS debe usar HTTPS')
 }
 
-async function testConnection(): Promise<boolean> {
-  if (!obsClient || !currentConfig) {
+async function headBucket(client: InstanceType<typeof ObsClient>, bucket: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    client.headBucket({ Bucket: bucket }, (error, result) => {
+      resolve(!error && result?.CommonMsg?.Status === 200)
+    })
+  })
+}
+
+async function configure(config: OBSConfigInput): Promise<boolean> {
+  validateConfig(config)
+  const candidate = createClient(config)
+  const connected = await headBucket(candidate, config.bucket)
+  if (!connected) {
+    candidate.close?.()
     return false
   }
 
-  return new Promise((resolve) => {
-    obsClient.headBucket({
-      Bucket: currentConfig!.bucket
-    }, (err: Error | null, result: { CommonMsg: { Status: number } }) => {
-      if (err) {
-        resolve(false)
-      } else {
-        resolve(result.CommonMsg.Status === 200)
-      }
-    })
-  })
+  obsClient?.close?.()
+  obsClient = candidate
+  currentConfig = { ...config }
+  saveOBSConfig(config)
+  return true
 }
 
-async function listObjects(prefix: string = ''): Promise<OBSObject[]> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
+async function connectStored(): Promise<boolean> {
+  const config = loadOBSConfig()
+  if (!config) return false
+  validateConfig(config)
+  const client = createClient(config)
+  if (!(await headBucket(client, config.bucket))) {
+    client.close?.()
+    return false
   }
-
-  return new Promise((resolve, reject) => {
-    obsClient.listObjects({
-      Bucket: currentConfig!.bucket,
-      Prefix: prefix,
-      Delimiter: '/'
-    }, (err: Error | null, result: {
-      CommonMsg: { Status: number; Message: string }
-      InterfaceResult: {
-        CommonPrefixes?: { Prefix: string }[]
-        Contents?: { Key: string; Size: number; LastModified: string; ETag: string }[]
-      }
-    }) => {
-      if (err) {
-        reject(err)
-        return
-      }
-
-      if (result.CommonMsg.Status !== 200) {
-        reject(new Error(`Failed to list objects: ${result.CommonMsg.Message}`))
-        return
-      }
-
-      const objects: OBSObject[] = []
-
-      // Add directories (CommonPrefixes)
-      if (result.InterfaceResult.CommonPrefixes) {
-        for (const dir of result.InterfaceResult.CommonPrefixes) {
-          const key = dir.Prefix
-          const name = key.replace(prefix, '').replace(/\/$/, '')
-          if (name) {
-            objects.push({
-              key,
-              name,
-              isDirectory: true,
-              size: 0,
-              lastModified: null
-            })
-          }
-        }
-      }
-
-      // Add files (Contents)
-      if (result.InterfaceResult.Contents) {
-        for (const obj of result.InterfaceResult.Contents) {
-          const key = obj.Key
-          const name = key.replace(prefix, '')
-          if (name && !name.endsWith('/')) {
-            objects.push({
-              key,
-              name,
-              isDirectory: false,
-              size: obj.Size,
-              lastModified: obj.LastModified || null,
-              etag: obj.ETag
-            })
-          }
-        }
-      }
-
-      // Sort: directories first, then alphabetically
-      objects.sort((a, b) => {
-        if (a.isDirectory && !b.isDirectory) return -1
-        if (!a.isDirectory && b.isDirectory) return 1
-        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-      })
-
-      resolve(objects)
-    })
-  })
+  obsClient?.close?.()
+  obsClient = client
+  currentConfig = config
+  return true
 }
 
-async function uploadObject(key: string, data: Buffer): Promise<void> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
-  }
-
-  return new Promise((resolve, reject) => {
-    obsClient.putObject({
-      Bucket: currentConfig!.bucket,
-      Key: key,
-      Body: data
-    }, (err: Error | null, result: { CommonMsg: { Status: number; Message: string } }) => {
-      if (err) {
-        reject(err)
-      } else if (result.CommonMsg.Status !== 200) {
-        reject(new Error(`Failed to upload: ${result.CommonMsg.Message}`))
-      } else {
-        resolve()
-      }
-    })
-  })
+function requireConnection(): { client: InstanceType<typeof ObsClient>; config: OBSConfigInput } {
+  if (!obsClient || !currentConfig) throw new Error('OBS no está conectado')
+  return { client: obsClient, config: currentConfig }
 }
 
-async function downloadObject(key: string): Promise<Buffer> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
+function assertSafeKey(key: string): void {
+  if (!ALLOWED_DESTINATIONS.some(prefix => key.startsWith(prefix)) || !key.toLowerCase().endsWith('.ogg')) {
+    throw new Error('La ruta OBS no está autorizada')
   }
-
-  return new Promise((resolve, reject) => {
-    obsClient.getObject({
-      Bucket: currentConfig!.bucket,
-      Key: key,
-      SaveAsStream: true
-    }, (err: Error | null, result: {
-      CommonMsg: { Status: number; Message: string }
-      InterfaceResult: { Content: Buffer | NodeJS.ReadableStream }
-    }) => {
-      if (err) {
-        reject(err)
-        return
-      }
-      if (result.CommonMsg.Status !== 200) {
-        reject(new Error(`Failed to download: ${result.CommonMsg.Message}`))
-        return
-      }
-
-      const content = result.InterfaceResult.Content
-
-      // With SaveAsStream the content is a readable stream; collect it into a Buffer
-      // so binary objects are preserved (a string would corrupt binary data via UTF-8)
-      if (Buffer.isBuffer(content)) {
-        resolve(content)
-      } else if (content && typeof (content as NodeJS.ReadableStream).on === 'function') {
-        const chunks: Buffer[] = []
-        const stream = content as NodeJS.ReadableStream
-        stream.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)))
-        stream.on('end', () => resolve(Buffer.concat(chunks)))
-        stream.on('error', reject)
-      } else {
-        reject(new Error('No content received from OBS'))
-      }
-    })
-  })
 }
 
-async function deleteObject(key: string): Promise<void> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
-  }
-
-  return new Promise((resolve, reject) => {
-    obsClient.deleteObject({
-      Bucket: currentConfig!.bucket,
-      Key: key
-    }, (err: Error | null, result: { CommonMsg: { Status: number; Message: string } }) => {
-      if (err) {
-        reject(err)
-      } else if (result.CommonMsg.Status !== 204 && result.CommonMsg.Status !== 200) {
-        reject(new Error(`Failed to delete: ${result.CommonMsg.Message}`))
-      } else {
-        resolve()
-      }
-    })
-  })
+function cleanEtag(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  return value.trim().replace(/^"|"$/g, '').toLowerCase()
 }
 
-async function deleteObjects(keys: string[]): Promise<void> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
-  }
+async function listAllObjects(prefix: string): Promise<RemoteAudioFile[]> {
+  if (!isAllowedDestination(prefix)) throw new Error('La carpeta OBS no está autorizada')
+  const { client, config } = requireConnection()
+  const objects: RemoteAudioFile[] = []
 
-  const objects = keys.map(key => ({ Key: key }))
-
-  return new Promise((resolve, reject) => {
-    obsClient.deleteObjects({
-      Bucket: currentConfig!.bucket,
-      Quiet: true,
-      Objects: objects
-    }, (err: Error | null, result: { CommonMsg: { Status: number; Message: string } }) => {
-      if (err) {
-        reject(err)
-      } else if (result.CommonMsg.Status !== 200) {
-        reject(new Error(`Failed to delete objects: ${result.CommonMsg.Message}`))
-      } else {
-        resolve()
-      }
-    })
-  })
-}
-
-async function createFolder(prefix: string): Promise<void> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
-  }
-
-  const folderKey = prefix.endsWith('/') ? prefix : prefix + '/'
-
-  return new Promise((resolve, reject) => {
-    obsClient.putObject({
-      Bucket: currentConfig!.bucket,
-      Key: folderKey,
-      Body: ''
-    }, (err: Error | null, result: { CommonMsg: { Status: number; Message: string } }) => {
-      if (err) {
-        reject(err)
-      } else if (result.CommonMsg.Status !== 200) {
-        reject(new Error(`Failed to create folder: ${result.CommonMsg.Message}`))
-      } else {
-        resolve()
-      }
-    })
-  })
-}
-
-async function listAllObjects(prefix: string = ''): Promise<OBSObject[]> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
-  }
-
-  const objects: OBSObject[] = []
-
-  const listPage = (marker?: string): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      const params: Record<string, unknown> = {
-        Bucket: currentConfig!.bucket,
-        Prefix: prefix,
-        MaxKeys: 1000
-      }
+  const listPage = async (marker?: string): Promise<void> => {
+    const result = await new Promise((resolve, reject) => {
+      const params: Record<string, unknown> = { Bucket: config.bucket, Prefix: prefix, MaxKeys: 1000 }
       if (marker) params.Marker = marker
-
-      obsClient.listObjects(params, (err: Error | null, result: {
-        CommonMsg: { Status: number; Message: string }
-        InterfaceResult: {
-          Contents?: { Key: string; Size: number; LastModified: string; ETag: string }[]
-          IsTruncated?: boolean
-          NextMarker?: string
-        }
-      }) => {
-        if (err) {
-          reject(err)
-          return
-        }
-        if (result.CommonMsg.Status !== 200) {
-          reject(new Error(`Failed to list objects: ${result.CommonMsg.Message}`))
-          return
-        }
-
-        const iface = result.InterfaceResult
-        if (iface.Contents) {
-          for (const obj of iface.Contents) {
-            const key = obj.Key
-            if (key === prefix) continue
-            const name = key.replace(prefix, '')
-            if (!name) continue
-            const isDirectory = key.endsWith('/')
-            objects.push({
-              key,
-              name,
-              isDirectory,
-              size: isDirectory ? 0 : obj.Size,
-              lastModified: obj.LastModified || null,
-              etag: obj.ETag
-            })
-          }
-        }
-
-        if (iface.IsTruncated && iface.NextMarker) {
-          listPage(iface.NextMarker).then(resolve, reject)
-        } else {
-          resolve()
-        }
-      })
+      client.listObjects(params, (error, response) => error ? reject(error) : resolve(response))
     })
+
+    if (result.CommonMsg.Status !== 200) {
+      throw new Error(`OBS no pudo listar la carpeta: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
+    }
+
+    for (const object of result.InterfaceResult.Contents ?? []) {
+      if (object.Key === prefix || object.Key.endsWith('/') || !object.Key.toLowerCase().endsWith('.ogg')) continue
+      objects.push({
+        key: object.Key,
+        relativePath: object.Key.slice(prefix.length).normalize('NFC'),
+        size: Number(object.Size),
+        etag: cleanEtag(object.ETag),
+        lastModified: object.LastModified ?? null
+      })
+    }
+
+    if (result.InterfaceResult.IsTruncated && result.InterfaceResult.NextMarker) {
+      await listPage(result.InterfaceResult.NextMarker)
+    }
   }
 
   await listPage()
   return objects
 }
 
-async function getObjectMetadata(key: string): Promise<{ size: number; lastModified: string; etag: string } | null> {
-  if (!obsClient || !currentConfig) {
-    throw new Error('OBS client not initialized')
-  }
+async function getMetadata(key: string): Promise<RemoteObjectMetadata | null> {
+  assertSafeKey(key)
+  const { client, config } = requireConnection()
 
-  return new Promise((resolve) => {
-    obsClient.getObjectMetadata({
-      Bucket: currentConfig!.bucket,
-      Key: key
-    }, (err: Error | null, result: {
-      CommonMsg: { Status: number }
-      InterfaceResult: { ContentLength: number; LastModified: string; ETag: string }
-    }) => {
-      if (err || result.CommonMsg.Status !== 200) {
-        resolve(null)
-      } else {
-        resolve({
-          size: result.InterfaceResult.ContentLength,
-          lastModified: result.InterfaceResult.LastModified,
-          etag: result.InterfaceResult.ETag
-        })
+  return new Promise((resolve, reject) => {
+    client.getObjectMetadata({ Bucket: config.bucket, Key: key }, (error, result) => {
+      const status = result?.CommonMsg?.Status
+      if (status === 404) return resolve(null)
+      if (error) return reject(error)
+      if (status !== 200) {
+        return reject(new Error(`OBS no pudo consultar el archivo: ${result?.CommonMsg?.Message ?? status}`))
       }
+
+      const metadata = result.InterfaceResult.Metadata ?? {}
+      const prefix = ALLOWED_DESTINATIONS.find(candidate => key.startsWith(candidate))!
+      resolve({
+        key,
+        relativePath: key.slice(prefix.length),
+        size: Number(result.InterfaceResult.ContentLength),
+        etag: cleanEtag(result.InterfaceResult.ETag),
+        sha256: metadata.sha256 ?? metadata.Sha256 ?? null,
+        lastModified: result.InterfaceResult.LastModified ?? null,
+        metadata
+      })
     })
   })
 }
 
-// IPC Handlers
-export const obsHandlers: Record<string, (event: IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>> = {
-  'obs:initialize': async (_, config: OBSConfig) => {
-    initialize(config)
-    return true
-  },
-
-  'obs:testConnection': async () => {
-    return testConnection()
-  },
-
-  'obs:isInitialized': async () => {
-    return isInitialized()
-  },
-
-  'obs:listObjects': async (_, prefix: string) => {
-    return listObjects(prefix || '')
-  },
-
-  'obs:listAllObjects': async (_, prefix: string) => {
-    return listAllObjects(prefix || '')
-  },
-
-  'obs:uploadObject': async (_, key: string, data: ArrayBuffer) => {
-    const buffer = Buffer.from(data)
-    await uploadObject(key, buffer)
-    return true
-  },
-
-  'obs:downloadObject': async (_, key: string) => {
-    const buffer = await downloadObject(key)
-    // Convert Buffer to Uint8Array for safe IPC transfer
-    return new Uint8Array(buffer).buffer
-  },
-
-  'obs:deleteObject': async (_, key: string) => {
-    await deleteObject(key)
-    return true
-  },
-
-  'obs:deleteObjects': async (_, keys: string[]) => {
-    await deleteObjects(keys)
-    return true
-  },
-
-  'obs:createFolder': async (_, prefix: string) => {
-    await createFolder(prefix)
-    return true
-  },
-
-  'obs:getObjectMetadata': async (_, key: string) => {
-    return getObjectMetadata(key)
+async function copyForBackup(sourceKey: string, backupKey: string): Promise<void> {
+  const { client, config } = requireConnection()
+  const result = await new Promise((resolve, reject) => {
+    client.copyObject({
+      Bucket: config.bucket,
+      Key: backupKey,
+      CopySource: `${config.bucket}/${sourceKey}`,
+      MetadataDirective: client.enums?.CopyMetadata
+    }, (error, response) => error ? reject(error) : resolve(response))
+  })
+  if (result.CommonMsg.Status >= 300) {
+    throw new Error(`No se pudo respaldar el archivo anterior: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
   }
+}
+
+async function putFile(event: IpcMainInvokeEvent, request: UploadRequest): Promise<UploadResult> {
+  const { client, config } = requireConnection()
+  const key = buildObjectKey(request.destination, request.relativePath)
+  const localPath = await validateLocalAudioPath(request.localPath, request.relativePath)
+  const stats = await fs.stat(localPath)
+  const digest = await hashAndValidateOgg(localPath)
+
+  if (stats.size !== request.digest.size || digest.md5 !== request.digest.md5 || digest.sha256 !== request.digest.sha256) {
+    throw new Error('El archivo local cambió después de la comparación. Volvé a analizar la carpeta.')
+  }
+
+  const current = await getMetadata(key)
+  if (current && !request.allowReplace) {
+    throw new Error('El archivo apareció en OBS después de la comparación. No se reemplazó.')
+  }
+  if (!current && request.allowReplace) {
+    throw new Error('El archivo que ibas a reemplazar ya no existe. Volvé a analizar la carpeta.')
+  }
+  if (current && request.allowReplace) {
+    const expected = request.expectedRemote
+    if (!expected || expected.size !== current.size || cleanEtag(expected.etag) !== cleanEtag(current.etag)) {
+      throw new Error('El archivo de OBS cambió después de la comparación. No se reemplazó.')
+    }
+  }
+
+  let backupKey: string | null = null
+  if (current) {
+    backupKey = buildBackupKey(request.destination, request.relativePath, new Date().toISOString())
+    await copyForBackup(key, backupKey)
+    const afterBackup = await getMetadata(key)
+    if (!afterBackup || afterBackup.size !== current.size || cleanEtag(afterBackup.etag) !== cleanEtag(current.etag)) {
+      throw new Error('El archivo de OBS cambió mientras se preparaba el respaldo. No se reemplazó.')
+    }
+  }
+
+  const result = await new Promise((resolve, reject) => {
+    client.putObject({
+      Bucket: config.bucket,
+      Key: key,
+      SourceFile: localPath,
+      ContentLength: stats.size,
+      Metadata: { sha256: digest.sha256 },
+      ProgressCallback: (transferredAmount, totalAmount, totalSeconds) => {
+        event.sender.send('obs:uploadProgress', {
+          transferId: request.transferId,
+          transferred: Number(transferredAmount),
+          total: Number(totalAmount || stats.size),
+          elapsedSeconds: Number(totalSeconds || 0)
+        } satisfies UploadProgress)
+      }
+    }, (error, response) => error ? reject(error) : resolve(response))
+  })
+
+  if (result.CommonMsg.Status >= 300) {
+    throw new Error(`OBS rechazó la carga: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
+  }
+
+  const uploaded = await getMetadata(key)
+  const verified = Boolean(
+    uploaded && uploaded.size === stats.size && (
+      uploaded.sha256?.toLowerCase() === digest.sha256 ||
+      cleanEtag(uploaded.etag) === digest.md5
+    )
+  )
+  if (!verified) {
+    throw new Error('OBS recibió el archivo, pero no se pudo verificar su contenido. No continúes sin revisarlo.')
+  }
+
+  return {
+    key,
+    replaced: current !== null,
+    backupKey,
+    verified,
+    etag: uploaded?.etag ?? null
+  }
+}
+
+export const obsHandlers: Record<string, (event: IpcMainInvokeEvent, ...args: any[]) => Promise<unknown>> = {
+  'obs:configure': async (_event, config: OBSConfigInput) => configure(config),
+  'obs:connectStored': async () => connectStored(),
+  'obs:testConnection': async () => {
+    const { client, config } = requireConnection()
+    return headBucket(client, config.bucket)
+  },
+  'obs:listAllObjects': async (_event, prefix: string) => listAllObjects(prefix),
+  'obs:getObjectMetadata': async (_event, key: string) => getMetadata(key),
+  'obs:uploadFile': putFile
 }

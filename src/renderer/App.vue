@@ -28,7 +28,10 @@ onMounted(async () => {
     <TitleBar />
 
     <div class="app-header">
-      <span class="app-header-title">Sincronización</span>
+      <div>
+        <span class="app-header-title">ClubF5 · Cargador de música</span>
+        <span class="safe-label">Solo carga · nunca elimina</span>
+      </div>
       <button @click="uiStore.openModal('settings')" class="btn btn-secondary">
         Configuración
       </button>
@@ -56,6 +59,10 @@ onMounted(async () => {
 
 .app-header-title {
   @apply text-sm font-semibold text-gray-700 dark:text-gray-200;
+}
+
+.safe-label {
+  @apply ml-3 text-xs font-medium text-emerald-600 dark:text-emerald-400;
 }
 
 .main-content {

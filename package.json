@@ -1,10 +1,11 @@
 {
   "name": "obs-clubf5-tool",
-  "version": "1.1.2",
-  "description": "Aplicación de escritorio para sincronizar archivos locales con Huawei OBS",
+  "version": "1.2.0",
+  "packageManager": "pnpm@10.30.1",
+  "description": "Cargador seguro de música de ClubF5 para Huawei OBS",
   "main": "dist-electron/main/index.js",
-  "homepage": "https://github.com/baselweb-frios/sync.obs.clubf5",
-  "repository": "https://github.com/baselweb-frios/sync.obs.clubf5.git",
+  "homepage": "https://github.com/hk-dev-er/sync.obs.clubf5",
+  "repository": "https://github.com/hk-dev-er/sync.obs.clubf5.git",
   "author": {
     "name": "Club F5",
     "email": "dev@clubf5.com"
@@ -13,14 +14,13 @@
     "dev": "electron .",
     "build": "vue-tsc --noEmit && vite build && electron-builder",
     "build:dir": "vue-tsc --noEmit && vite build && electron-builder --dir",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
-    "chokidar": "^3.6.0",
     "electron-store": "^8.2.0",
-    "electron-updater": "^6.8.9",
-    "esdk-obs-nodejs": "^3.26.2",
-    "minimatch": "^9.0.9",
+    "esdk-obs-nodejs": "3.26.2",
     "pinia": "^2.3.1",
     "vue": "^3.5.38"
   },
@@ -30,7 +30,7 @@
     "@vitejs/plugin-vue": "^5.2.4",
     "autoprefixer": "^10.5.0",
     "dmg-license": "^1.0.11",
-    "electron": "^33.4.11",
+    "electron": "44.4.3",
     "electron-builder": "^26.15.3",
     "postcss": "^8.5.15",
     "tailwindcss": "^3.4.19",
@@ -38,11 +38,17 @@
     "vite": "^6.4.3",
     "vite-plugin-electron": "^0.28.8",
     "vite-plugin-electron-renderer": "^0.14.7",
+    "vitest": "^5.0.1",
     "vue-tsc": "^2.2.12"
+  },
+  "pnpm": {
+    "overrides": {
+      "fast-xml-parser": "5.7.0"
+    }
   },
   "build": {
     "appId": "com.github.baselweb-frios.sync-obs",
-    "productName": "Clubf5 Tools OBScloud",
+    "productName": "ClubF5 Cargador OBS",
     "directories": {
       "output": "release"
     },
@@ -57,8 +63,7 @@
         {
           "target": "nsis",
           "arch": [
-            "x64",
-            "ia32"
+            "x64"
           ]
         },
         {
@@ -142,7 +147,7 @@
       "allowElevation": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Sync OBS"
+      "shortcutName": "ClubF5 Cargador OBS"
     },
     "portable": {
       "artifactName": "${productName}-${version}-portable.exe"
