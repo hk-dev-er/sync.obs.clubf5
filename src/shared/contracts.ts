@@ -74,5 +74,6 @@ export interface UploadReport {
 }
 
 export interface RemoteObjectMetadata extends RemoteAudioFile {
+  jobId?: string | null
   metadata: Record<string, string>
 }

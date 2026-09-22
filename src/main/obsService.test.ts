@@ -71,7 +71,8 @@ describe('uploader account and resumable transfer', () => {
       if (url.includes('/objects/metadata?')) {
         metadataReads += 1
         return metadataReads === 1 ? json({ error: 'not_found' }, 404)
-          : json({ sizeBytes: bytes.length, eTag: 'final-etag', sha256, lastModified: null })
+          : json({ sizeBytes: bytes.length, eTag: 'final-etag', sha256,
+            jobId: 'job', lastModified: null })
       }
       if (url.endsWith('/files/job')) return json({ job: { id: 'job', objectKey: key,
         sizeBytes: bytes.length, sha256, partSizeBytes: 8 * 1024 * 1024,
@@ -116,7 +117,8 @@ describe('uploader account and resumable transfer', () => {
       if (url.includes('/objects/metadata?')) {
         metadataReads += 1
         return metadataReads === 1 ? json({ error: 'not_found' }, 404)
-          : json({ sizeBytes: bytes.length, eTag: 'final-etag', sha256, lastModified: null })
+          : json({ sizeBytes: bytes.length, eTag: 'final-etag', sha256,
+            jobId: 'job', lastModified: null })
       }
       if (url.endsWith('/sessions/session/files') && init?.method === 'POST') {
         const body = JSON.parse(String(init.body)) as { sha256: string; replaceExisting: boolean }

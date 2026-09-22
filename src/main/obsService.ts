@@ -20,7 +20,8 @@ interface Job {
   partSizeBytes: number; partCount: number; replaceExisting: boolean
   previousETag: string | null; backupKey: string | null; status: string
 }
-interface RemoteMetadata { sizeBytes: number; eTag: string; sha256: string | null; lastModified: string | null }
+interface RemoteMetadata { sizeBytes: number; eTag: string; sha256: string | null;
+  jobId: string | null; lastModified: string | null }
 interface Part { number: number; sizeBytes: number; eTag: string }
 
 class ApiError extends Error {
@@ -190,7 +191,8 @@ async function getMetadata(key: string): Promise<RemoteObjectMetadata | null> {
   try {
     const item = await api<RemoteMetadata>(`/music-uploader/objects/metadata?key=${encodeURIComponent(key)}`)
     return { key, relativePath: key.slice(prefix.length), size: item.sizeBytes,
-      etag: cleanEtag(item.eTag), sha256: item.sha256, lastModified: item.lastModified,
+      etag: cleanEtag(item.eTag), sha256: item.sha256, jobId: item.jobId,
+      lastModified: item.lastModified,
       metadata: item.sha256 ? { sha256: item.sha256 } : {} }
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return null
@@ -269,7 +271,8 @@ async function uploadFile(event: IpcMainInvokeEvent, request: UploadRequest): Pr
   }
   if (resumed.job?.status === 'completed') {
     const published = await getMetadata(key)
-    if (published?.size === size && published.sha256?.toLowerCase() === digest.sha256) {
+    if (published?.size === size && published.sha256?.toLowerCase() === digest.sha256
+      && published.jobId?.toLowerCase() === resumed.job.id.toLowerCase()) {
       return { key, replaced: request.allowReplace, backupKey: resumed.job.backupKey,
         verified: true, etag: published.etag }
     }
@@ -321,6 +324,7 @@ async function uploadFile(event: IpcMainInvokeEvent, request: UploadRequest): Pr
   if (job.status !== 'completed') throw new Error('La carga no quedó confirmada. Podés reanudarla más tarde.')
   const [published, after] = await Promise.all([getMetadata(key), hashAndValidateOgg(file)])
   if (!published || published.size !== size || published.sha256?.toLowerCase() !== digest.sha256
+    || published.jobId?.toLowerCase() !== job.id.toLowerCase()
     || after.sha256 !== digest.sha256) {
     throw new Error('No se pudo confirmar el contenido final. No continúes sin revisarlo.')
   }
