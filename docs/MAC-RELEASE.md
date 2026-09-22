@@ -1,0 +1,14 @@
+# macOS: auditoría y salida controlada
+
+Los DMG antiguos recibidos de Facundo son `Clubf5-Tools-OBScloud-1.1.2-mac-x64.dmg` (107.483.229 bytes, SHA-256 `960f3547318eb146ab856cde73cae08d4c439c9845f9aadb9bcdfb6937b2e716`) y `Clubf5-Tools-OBScloud-1.1.2-mac-arm64.dmg` (102.887.950 bytes, SHA-256 `0bd99dbe99bad1f292f68a629ce5bde0b76aa0dde0550b267e21b9c4354e64c9`). Son anteriores al acceso por operador; no deben redistribuirse como versión nueva. El repositorio propio publicó hasta v1.2.2 **solo Windows**.
+
+La app de PR4 comparte código Electron entre Windows y macOS: no contiene el SDK OBS ni pide AK/SK. PR5 agrega compilación macOS en CI, firma, notarización y comprobación de Gatekeeper para DMG x64 y arm64. El tag por sí solo ya no publica nada: el workflow se lanza manualmente desde `main`, exige que el tag y la versión coincidan con ese mismo commit y espera que **ambas** plataformas terminen antes de crear la release pública.
+
+## Requisitos antes de publicar v1.3.0
+
+1. API ClubF5 PR1–PR3 integrada y probada con SQL Server y bucket OBS de prueba: alta/revocación, carpeta permitida, login, renovación, partes reanudadas, reemplazo respaldado y lectura de contenido final. La app PR4 debe probarse con una cuenta de cargador real, nunca con credenciales de producción en logs.
+2. PR4 y PR5 revisados, CI Windows/macOS verde. Probar en una Mac Intel y una Apple Silicon la instalación, Keychain, login, cierre, reanudación y reproducción del OGG subido. Validar que el DMG instala sin instrucciones para desactivar Gatekeeper.
+3. Agregar a *Settings → Secrets and variables → Actions* del repositorio `hk-dev-er/sync.obs.clubf5`: `MAC_CSC_LINK` (Developer ID Application `.p12` codificado en base64), `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY` (contenido `.p8` en base64), `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`, `APPLE_TEAM_ID` y el certificado Windows `WIN_CSC_LINK`/`WIN_CSC_KEY_PASSWORD`. No enviarlos por chat ni incorporarlos al repositorio. Actualmente **no hay secretos configurados**. La firma Windows también se exige: las versiones previas sin firma provocaron alertas de antivirus; firmar no garantiza que desaparezcan, pero aporta procedencia verificable.
+4. Recién después de aprobar la integración, mergear PR4 y PR5, crear el tag `v1.3.0` en el HEAD de `main` y lanzar manualmente **Publicar cargador de música** con ese tag. El workflow falla antes de publicar si falta firma, notarización, una app de ambas arquitecturas o la compilación Windows.
+
+La [guía oficial de electron-builder](https://www.electron.build/v26/docs/notarization/) explica la firma Developer ID, el uso de API key de Apple en CI y la validación con `spctl`, `codesign` y `stapler`.
