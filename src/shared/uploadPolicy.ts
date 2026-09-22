@@ -4,14 +4,11 @@ export type DestinationPrefix = `${typeof MUSIC_ROOT}${string}/`
 
 export function isAllowedDestination(value: string): value is DestinationPrefix {
   if (!value.startsWith(MUSIC_ROOT) || !value.endsWith('/')) return false
-  const folderName = value.slice(MUSIC_ROOT.length, -1)
-  return Boolean(
-    folderName &&
-    folderName !== '.' &&
-    folderName !== '..' &&
-    !folderName.includes('/') &&
-    !/[\u0000-\u001f\u007f]/.test(folderName)
-  )
+  const folderPath = value.slice(MUSIC_ROOT.length, -1)
+  if (!folderPath || value.length > 1024) return false
+  return folderPath.split('/').every(segment => segment.length > 0 &&
+    segment !== '.' && segment !== '..' && segment.trim() === segment &&
+    !/[\\%:*?#\u0000-\u001f\u007f]/.test(segment))
 }
 
 export function destinationLabel(destination: DestinationPrefix): string {
