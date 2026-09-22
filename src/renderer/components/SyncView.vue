@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useConfigStore } from '../stores/configStore'
 import { useUIStore } from '../stores/uiStore'
 import type {
@@ -15,7 +15,7 @@ import {
   type UploadPlan,
   type UploadPlanItem
 } from '../../shared/syncPlan'
-import { ALLOWED_DESTINATIONS, type DestinationPrefix } from '../../shared/uploadPolicy'
+import { destinationLabel, MUSIC_ROOT, type DestinationPrefix } from '../../shared/uploadPolicy'
 
 const configStore = useConfigStore()
 const uiStore = useUIStore()
@@ -33,9 +33,12 @@ const completedBytes = ref(0)
 const currentTransferred = ref(0)
 const uploadStartedAt = ref(0)
 const uploadTotalBytes = ref(0)
+const musicFolders = ref<DestinationPrefix[]>([])
+const loadingMusicFolders = ref(false)
 
 let unsubscribeScan: (() => void) | null = null
 let unsubscribeUpload: (() => void) | null = null
+let folderLoadRequest = 0
 
 const newItems = computed(() => plan.value?.items.filter(item => item.kind === 'upload-new') ?? [])
 const conflicts = computed(() => plan.value?.items.filter(item => item.kind === 'conflict') ?? [])
@@ -46,6 +49,9 @@ const progressBytes = computed(() => Math.min(uploadTotalBytes.value, completedB
 const progressPercent = computed(() => uploadTotalBytes.value === 0
   ? 0
   : Math.round((progressBytes.value / uploadTotalBytes.value) * 100))
+const selectedDestination = computed(() => musicFolders.value.includes(configStore.destination)
+  ? configStore.destination
+  : '')
 const speed = computed(() => {
   const seconds = (Date.now() - uploadStartedAt.value) / 1000
   return seconds > 0 ? progressBytes.value / seconds : 0
@@ -60,6 +66,15 @@ onMounted(() => {
     }
   })
 })
+
+watch(
+  () => [configStore.isConnected, configStore.connectionRevision] as const,
+  ([connected]) => {
+    if (connected) void loadMusicFolders()
+    else musicFolders.value = []
+  },
+  { immediate: true }
+)
 
 onUnmounted(() => {
   unsubscribeScan?.()
@@ -79,8 +94,42 @@ function formatEta(seconds: number): string {
   return `${Math.ceil(seconds / 60)} min`
 }
 
-function destinationLabel(destination: DestinationPrefix): string {
-  return destination.includes('Melodic_Techno') ? 'Melodic Techno' : 'Progressive'
+async function loadMusicFolders(): Promise<void> {
+  const request = ++folderLoadRequest
+  loadingMusicFolders.value = true
+  try {
+    const folders = await window.electronAPI.obsListMusicFolders()
+    if (request !== folderLoadRequest) return
+    musicFolders.value = folders
+    if (folders.length === 0) {
+      uiStore.notify({
+        type: 'error',
+        title: 'No hay carpetas musicales disponibles',
+        message: `OBS no devolvió carpetas existentes dentro de ${MUSIC_ROOT}.`,
+        duration: 0
+      })
+      return
+    }
+    if (!folders.includes(configStore.destination)) {
+      resetAnalysis()
+      uiStore.notify({
+        type: 'warning',
+        title: 'Elegí la carpeta de destino',
+        message: 'La carpeta guardada ya no está disponible en OBS.'
+      })
+    }
+  } catch (error) {
+    if (request !== folderLoadRequest) return
+    musicFolders.value = []
+    uiStore.notify({
+      type: 'error',
+      title: 'No se pudieron cargar las carpetas musicales',
+      message: (error as Error).message,
+      duration: 0
+    })
+  } finally {
+    if (request === folderLoadRequest) loadingMusicFolders.value = false
+  }
 }
 
 async function chooseFolder(): Promise<void> {
@@ -104,7 +153,7 @@ function resetAnalysis(): void {
 }
 
 async function analyze(): Promise<void> {
-  if (!configStore.localPath || !configStore.isConnected) return
+  if (!configStore.localPath || !configStore.isConnected || !musicFolders.value.includes(configStore.destination)) return
   analyzing.value = true
   report.value = null
   plan.value = null
@@ -316,9 +365,17 @@ async function retryFailed(): Promise<void> {
       </div>
 
       <div class="field">
-        <label for="destination">Carpeta de destino</label>
-        <select id="destination" class="input" :value="configStore.destination" :disabled="uploading" @change="changeDestination">
-          <option v-for="destination in ALLOWED_DESTINATIONS" :key="destination" :value="destination">
+        <div class="field-heading">
+          <label for="destination">Carpeta de destino</label>
+          <button class="refresh-folders" type="button" :disabled="uploading || loadingMusicFolders || !configStore.isConnected" @click="loadMusicFolders">
+            {{ loadingMusicFolders ? 'Actualizando…' : 'Actualizar lista' }}
+          </button>
+        </div>
+        <select id="destination" class="input" :value="selectedDestination" :disabled="uploading || loadingMusicFolders || musicFolders.length === 0" @change="changeDestination">
+          <option v-if="loadingMusicFolders" disabled>Cargando carpetas…</option>
+          <option v-else-if="musicFolders.length === 0" disabled>No hay carpetas musicales</option>
+          <option v-else-if="!selectedDestination" value="" disabled>Elegí una carpeta musical</option>
+          <option v-for="destination in musicFolders" :key="destination" :value="destination">
             {{ destinationLabel(destination) }}
           </option>
         </select>
@@ -326,7 +383,7 @@ async function retryFailed(): Promise<void> {
 
       <button
         class="btn btn-primary analyze-btn"
-        :disabled="!configStore.localPath || !configStore.isConnected || analyzing || uploading"
+        :disabled="!configStore.localPath || !configStore.isConnected || !musicFolders.includes(configStore.destination) || analyzing || uploading"
         @click="analyze"
       >
         {{ analyzing ? 'Comparando contenido…' : 'Comparar antes de cargar' }}
@@ -455,6 +512,8 @@ async function retryFailed(): Promise<void> {
 .setup-panel { @apply grid grid-cols-[minmax(0,2fr)_minmax(220px,1fr)_auto] items-end gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800; }
 .field { @apply space-y-2; }
 .field label { @apply text-sm font-semibold text-slate-700 dark:text-slate-200; }
+.field-heading { @apply flex items-center justify-between gap-3; }
+.refresh-folders { @apply text-xs font-semibold text-sky-600 hover:text-sky-700 disabled:cursor-not-allowed disabled:text-slate-400 dark:text-sky-400 dark:hover:text-sky-300; }
 .path-row { @apply flex min-h-10 items-center justify-between gap-3 rounded-lg border border-slate-300 bg-slate-50 pl-3 dark:border-slate-600 dark:bg-slate-900; }
 .path-row span { @apply truncate text-sm text-slate-700 dark:text-slate-200; }
 .path-row .placeholder { @apply text-slate-400; }

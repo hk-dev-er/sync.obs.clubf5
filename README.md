@@ -5,7 +5,8 @@ Aplicación de escritorio para cargar música OGG desde una computadora a Huawei
 ## Contrato de seguridad
 
 - Solo carga desde la PC hacia OBS.
-- Solo permite `Music/online/Progressive/` y `Music/online/Melodic_Techno/`.
+- Solo permite carpetas musicales ya existentes directamente dentro de `Music/online/`.
+- Los destinos se consultan a OBS y se eligen desde una lista: no se pueden escribir rutas ni crear carpetas desde la aplicación.
 - Compara contenido mediante SHA-256/MD5; no usa fecha ni tamaño como prueba de igualdad.
 - Si un nombre ya existe con otro contenido, conserva OBS hasta que el operador elija **Reemplazar**.
 - Antes de reemplazar, copia el objeto anterior a `_clubf5-backups/`.

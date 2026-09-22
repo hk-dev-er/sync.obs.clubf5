@@ -16,6 +16,7 @@ export const useConfigStore = defineStore('config', () => {
     accessKeyIdHint: ''
   })
   const isConnected = ref(false)
+  const connectionRevision = ref(0)
   const isLoading = ref(false)
   const connectionError = ref<string | null>(null)
 
@@ -43,6 +44,7 @@ export const useConfigStore = defineStore('config', () => {
 
       if (obsStatus.value.configured) {
         isConnected.value = await window.electronAPI.obsConnectStored()
+        if (isConnected.value) connectionRevision.value += 1
         if (!isConnected.value) connectionError.value = 'No se pudo conectar con la credencial guardada'
       }
     } catch (error) {
@@ -59,6 +61,7 @@ export const useConfigStore = defineStore('config', () => {
       const connected = await window.electronAPI.obsConfigure(config)
       isConnected.value = connected
       if (connected) {
+        connectionRevision.value += 1
         obsStatus.value = await window.electronAPI.getOBSStatus()
       } else {
         connectionError.value = 'La credencial o los datos del bucket fueron rechazados'
@@ -99,6 +102,7 @@ export const useConfigStore = defineStore('config', () => {
     theme,
     obsStatus,
     isConnected,
+    connectionRevision,
     isLoading,
     connectionError,
     hasOBSConfig,

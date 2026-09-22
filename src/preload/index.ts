@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   obsConfigure: (config: OBSConfigInput): Promise<boolean> => ipcRenderer.invoke('obs:configure', config),
   obsConnectStored: (): Promise<boolean> => ipcRenderer.invoke('obs:connectStored'),
   obsTestConnection: (): Promise<boolean> => ipcRenderer.invoke('obs:testConnection'),
+  obsListMusicFolders: (): Promise<DestinationPrefix[]> => ipcRenderer.invoke('obs:listMusicFolders'),
   obsListAllObjects: (prefix: DestinationPrefix): Promise<RemoteAudioFile[]> =>
     ipcRenderer.invoke('obs:listAllObjects', prefix),
   obsGetObjectMetadata: (key: string): Promise<RemoteObjectMetadata | null> =>
