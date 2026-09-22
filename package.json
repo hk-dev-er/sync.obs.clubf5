@@ -1,6 +1,6 @@
 {
   "name": "obs-clubf5-tool",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "packageManager": "pnpm@10.30.1",
   "description": "Cargador seguro de música de ClubF5 para Huawei OBS",
   "main": "dist-electron/main/index.js",
