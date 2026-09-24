@@ -28,6 +28,7 @@ const scanResult = ref<LocalScanResult | null>(null)
 const plan = ref<UploadPlan | null>(null)
 const report = ref<UploadReport | null>(null)
 const showReport = ref(false)
+const savedReportPath = ref<string | null>(null)
 const operationError = ref<{ title: string; message: string } | null>(null)
 const confirmCancelButton = ref<HTMLButtonElement | null>(null)
 const reportCloseButton = ref<HTMLButtonElement | null>(null)
@@ -235,6 +236,7 @@ function resetAnalysis(): void {
   scanResult.value = null
   report.value = null
   showReport.value = false
+  savedReportPath.value = null
   operationError.value = null
   confirming.value = false
 }
@@ -249,6 +251,7 @@ async function analyze(): Promise<void> {
   analyzing.value = true
   report.value = null
   showReport.value = false
+  savedReportPath.value = null
   operationError.value = null
   plan.value = null
   scanProgress.value = { processed: 0, total: 0, currentFile: '' }
@@ -395,6 +398,7 @@ async function runUpload(items: UploadPlanItem[], seedEntries: UploadReportEntry
     return
   }
   report.value = makeReport(entries)
+  savedReportPath.value = null
   showReport.value = true
 
   if (report.value.totals.failed === 0) {
@@ -425,8 +429,12 @@ function makeReport(entries: UploadReportEntry[]): UploadReport {
 async function saveReport(): Promise<void> {
   if (!report.value) return
   const plainReport = JSON.parse(JSON.stringify(report.value)) as UploadReport
-  const path = await window.electronAPI.saveReport(plainReport)
-  if (path) uiStore.notify({ type: 'success', title: 'Informe guardado', message: path })
+  try {
+    const path = await window.electronAPI.saveReport(plainReport)
+    if (path) savedReportPath.value = path
+  } catch (error) {
+    showOperationError('No se pudo guardar el informe', (error as Error).message)
+  }
 }
 
 async function retryFailed(): Promise<void> {
@@ -611,6 +619,7 @@ async function retryFailed(): Promise<void> {
               <strong>{{ entry.relativePath }}</strong> — {{ entry.message }}
             </p>
           </details>
+          <p v-if="savedReportPath" class="report-saved" role="status">Informe guardado en {{ savedReportPath }}</p>
         </div>
         <footer class="dialog-actions">
           <button class="btn btn-secondary" @click="saveReport">Guardar informe</button>
@@ -703,6 +712,7 @@ async function retryFailed(): Promise<void> {
 .report-problems { @apply rounded-xl border border-red-900 bg-red-950/40 p-4 text-sm text-red-200; }
 .report-problems summary { @apply cursor-pointer font-semibold; }
 .report-problems p { @apply mt-2 break-words; }
+.report-saved { @apply break-all rounded-xl border border-emerald-800 bg-emerald-950/30 p-3 text-sm text-emerald-200; }
 @media (max-width: 900px) {
   .setup-panel { @apply grid-cols-1; }
   .summary-grid { @apply grid-cols-2; }
