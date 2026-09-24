@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useConfigStore } from '../stores/configStore'
 import { useUIStore } from '../stores/uiStore'
 import type {
@@ -27,6 +27,15 @@ const scanProgress = ref<ScanProgress>({ processed: 0, total: 0, currentFile: ''
 const scanResult = ref<LocalScanResult | null>(null)
 const plan = ref<UploadPlan | null>(null)
 const report = ref<UploadReport | null>(null)
+const showReport = ref(false)
+const operationError = ref<{ title: string; message: string } | null>(null)
+const confirmCancelButton = ref<HTMLButtonElement | null>(null)
+const reportCloseButton = ref<HTMLButtonElement | null>(null)
+const errorCloseButton = ref<HTMLButtonElement | null>(null)
+const reviewButton = ref<HTMLButtonElement | null>(null)
+const resultLinkButton = ref<HTMLButtonElement | null>(null)
+const compareButton = ref<HTMLButtonElement | null>(null)
+const refreshButton = ref<HTMLButtonElement | null>(null)
 const currentFile = ref('')
 const currentTransferId = ref('')
 const completedBytes = ref(0)
@@ -47,6 +56,8 @@ const uploads = computed(() => newItems.value.filter(item => item.decision === '
 const actionItems = computed(() => [...uploads.value, ...replacements.value])
 const unchangedCount = computed(() => (plan.value?.counts.identical ?? 0) +
   (plan.value?.counts.remoteOnly ?? 0) + conflicts.value.length - replacements.value.length)
+const reportHasIssues = computed(() => Boolean(report.value &&
+  (report.value.totals.failed > 0 || report.value.totals.invalid > 0)))
 const progressBytes = computed(() => Math.min(uploadTotalBytes.value, completedBytes.value + currentTransferred.value))
 const progressPercent = computed(() => uploadTotalBytes.value === 0
   ? 0
@@ -89,6 +100,79 @@ onUnmounted(() => {
   unsubscribeUpload?.()
 })
 
+watch(confirming, async open => {
+  if (open) {
+    await nextTick()
+    confirmCancelButton.value?.focus()
+  }
+})
+
+watch(showReport, async open => {
+  if (open) {
+    await nextTick()
+    reportCloseButton.value?.focus()
+  }
+})
+
+watch(operationError, async error => {
+  if (error) {
+    await nextTick()
+    errorCloseButton.value?.focus()
+  }
+})
+
+function onDialogKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    if (operationError.value) void closeOperationError()
+    else if (showReport.value) void closeReport()
+    else void closeConfirmation()
+    return
+  }
+  if (event.key !== 'Tab') return
+  const elements = Array.from((event.currentTarget as HTMLElement)
+    .querySelectorAll<HTMLElement>('button:not([disabled]), summary'))
+  if (elements.length === 0) return
+  const first = elements[0]
+  const last = elements[elements.length - 1]
+  if (!elements.includes(document.activeElement as HTMLElement)) {
+    event.preventDefault()
+    first.focus()
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+
+async function closeConfirmation(): Promise<void> {
+  confirming.value = false
+  await nextTick()
+  reviewButton.value?.focus()
+}
+
+async function closeReport(): Promise<void> {
+  showReport.value = false
+  await nextTick()
+  resultLinkButton.value?.focus()
+}
+
+async function closeOperationError(): Promise<void> {
+  operationError.value = null
+  await nextTick()
+  const target = compareButton.value && !compareButton.value.disabled
+    ? compareButton.value : refreshButton.value
+  target?.focus()
+}
+
+function showOperationError(title: string, message: string): void {
+  confirming.value = false
+  showReport.value = false
+  operationError.value = { title, message }
+}
+
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']
@@ -111,12 +195,8 @@ async function loadMusicFolders(): Promise<void> {
     musicFolders.value = folders
     configStore.setAvailableDestinations(folders)
     if (folders.length === 0) {
-      uiStore.notify({
-        type: 'error',
-        title: 'No tenés carpetas asignadas',
-        message: `Pedile al administrador acceso a una carpeta dentro de ${MUSIC_ROOT}.`,
-        duration: 0
-      })
+      showOperationError('No tenés carpetas asignadas',
+        `Pedile al administrador acceso a una carpeta dentro de ${MUSIC_ROOT}.`)
       return
     }
     if (!folders.includes(configStore.destination)) {
@@ -131,12 +211,7 @@ async function loadMusicFolders(): Promise<void> {
     if (request !== folderLoadRequest) return
     musicFolders.value = []
     configStore.setAvailableDestinations([])
-    uiStore.notify({
-      type: 'error',
-      title: 'No se pudieron cargar las carpetas musicales',
-      message: (error as Error).message,
-      duration: 0
-    })
+    showOperationError('No se pudieron cargar las carpetas musicales', (error as Error).message)
   } finally {
     if (request === folderLoadRequest) loadingMusicFolders.value = false
   }
@@ -159,13 +234,22 @@ function resetAnalysis(): void {
   plan.value = null
   scanResult.value = null
   report.value = null
+  showReport.value = false
+  operationError.value = null
   confirming.value = false
+}
+
+function countLabel(count: number, singular: string, plural: string): string {
+  return `${count} ${count === 1 ? singular : plural}`
 }
 
 async function analyze(): Promise<void> {
   if (!configStore.localPath || !configStore.isConnected || !musicFolders.value.includes(configStore.destination)) return
+  const connectionRevision = configStore.connectionRevision
   analyzing.value = true
   report.value = null
+  showReport.value = false
+  operationError.value = null
   plan.value = null
   scanProgress.value = { processed: 0, total: 0, currentFile: '' }
 
@@ -174,6 +258,7 @@ async function analyze(): Promise<void> {
       window.electronAPI.scanLocalAudio(configStore.localPath),
       window.electronAPI.obsListAllObjects(configStore.destination)
     ])
+    if (!configStore.isConnected || configStore.connectionRevision !== connectionRevision) return
     scanResult.value = local
 
     const localByPath = new Map(local.files.map(file => [file.relativePath, file]))
@@ -185,17 +270,13 @@ async function analyze(): Promise<void> {
       }
     }
 
+    if (!configStore.isConnected || configStore.connectionRevision !== connectionRevision) return
+
     plan.value = buildUploadPlan(local.files, remote)
-    for (const notification of uiStore.notifications.filter(item => item.title === 'No se pudo comparar')) {
-      uiStore.removeNotification(notification.id)
-    }
-    uiStore.notify({
-      type: 'success',
-      title: 'Comparación terminada',
-      message: `${local.files.length} audios locales revisados por contenido.`
-    })
   } catch (error) {
-    uiStore.notify({ type: 'error', title: 'No se pudo comparar', message: (error as Error).message, duration: 0 })
+    if (configStore.isConnected && configStore.connectionRevision === connectionRevision) {
+      showOperationError('No se pudo comparar', (error as Error).message)
+    }
   } finally {
     analyzing.value = false
   }
@@ -259,7 +340,8 @@ function baseReportEntries(): UploadReportEntry[] {
 }
 
 async function runUpload(items: UploadPlanItem[], seedEntries: UploadReportEntry[] = baseReportEntries()): Promise<void> {
-  if (items.length === 0) return
+  if (items.length === 0 || uploading.value) return
+  const connectionRevision = configStore.connectionRevision
   uploading.value = true
   confirming.value = false
   const entries = [...seedEntries]
@@ -308,20 +390,17 @@ async function runUpload(items: UploadPlanItem[], seedEntries: UploadReportEntry
   currentFile.value = ''
   currentTransferId.value = ''
   uploading.value = false
+  if (!configStore.isConnected || configStore.connectionRevision !== connectionRevision) {
+    resetAnalysis()
+    return
+  }
   report.value = makeReport(entries)
+  showReport.value = true
 
-  if (report.value.totals.failed > 0) {
-    uiStore.notify({
-      type: 'error',
-      title: `${report.value.totals.failed} archivo(s) no se cargaron`,
-      message: 'Los demás resultados están en el informe. Podés reintentar solo los fallidos.',
-      duration: 0
-    })
-  } else {
+  if (report.value.totals.failed === 0) {
     // A completed upload changes OBS, so the previous comparison is no longer current.
     plan.value = null
     scanResult.value = null
-    uiStore.notify({ type: 'success', title: 'Carga terminada y verificada' })
   }
 }
 
@@ -354,6 +433,7 @@ async function retryFailed(): Promise<void> {
   if (!report.value || !plan.value) return
   const failed = new Set(report.value.entries.filter(entry => entry.action === 'failed').map(entry => entry.relativePath))
   const retained = report.value.entries.filter(entry => entry.action !== 'failed')
+  showReport.value = false
   await runUpload(actionItems.value.filter(item => failed.has(item.relativePath)), retained)
 }
 </script>
@@ -383,7 +463,7 @@ async function retryFailed(): Promise<void> {
       <div class="field">
         <div class="field-heading">
           <label for="destination">Carpeta de destino</label>
-          <button class="refresh-folders" type="button" :disabled="uploading || loadingMusicFolders || !configStore.isConnected" @click="loadMusicFolders">
+          <button ref="refreshButton" class="refresh-folders" type="button" :disabled="uploading || loadingMusicFolders || !configStore.isConnected" @click="loadMusicFolders">
             {{ loadingMusicFolders ? 'Actualizando…' : 'Actualizar lista' }}
           </button>
         </div>
@@ -398,6 +478,7 @@ async function retryFailed(): Promise<void> {
       </div>
 
       <button
+        ref="compareButton"
         class="btn btn-primary analyze-btn"
         :disabled="!configStore.localPath || !configStore.isConnected || !musicFolders.includes(configStore.destination) || analyzing || uploading"
         @click="analyze"
@@ -405,6 +486,10 @@ async function retryFailed(): Promise<void> {
         {{ analyzing ? 'Comparando contenido…' : 'Comparar antes de cargar' }}
       </button>
     </section>
+
+    <button v-if="report && !uploading" ref="resultLinkButton" class="result-link" type="button" @click="showReport = true">
+      Ver resultado de la última carga
+    </button>
 
     <div v-if="analyzing" class="progress-card">
       <div class="progress-copy">
@@ -462,21 +547,9 @@ async function retryFailed(): Promise<void> {
           <strong>{{ uploads.length }} {{ uploads.length === 1 ? 'nuevo' : 'nuevos' }} · {{ replacements.length }} {{ replacements.length === 1 ? 'reemplazo' : 'reemplazos' }}</strong>
           <p>{{ unchangedCount }} {{ unchangedCount === 1 ? 'archivo queda' : 'archivos quedan' }} sin cambios.</p>
         </div>
-        <button class="btn btn-primary" :disabled="actionItems.length === 0" @click="requestConfirmation">Revisar carga</button>
+        <button ref="reviewButton" class="btn btn-primary" :disabled="actionItems.length === 0" @click="requestConfirmation">Revisar carga</button>
       </section>
 
-      <section v-if="confirming" class="confirmation-panel">
-        <div>
-          <p class="eyebrow">Confirmación final</p>
-          <h2>Se cargarán {{ uploads.length }} {{ uploads.length === 1 ? 'archivo nuevo' : 'archivos nuevos' }} y se {{ replacements.length === 1 ? 'reemplazará' : 'reemplazarán' }} {{ replacements.length }}.</h2>
-          <p v-if="replacements.length">Cada reemplazo guarda primero una copia del archivo anterior.</p>
-          <p>Ningún archivo remoto será eliminado.</p>
-        </div>
-        <div class="confirmation-actions">
-          <button class="btn btn-secondary" @click="confirming = false">Volver</button>
-          <button class="btn btn-primary" @click="runUpload([...actionItems])">Confirmar carga</button>
-        </div>
-      </section>
     </template>
 
     <section v-if="uploading" class="upload-panel">
@@ -492,30 +565,74 @@ async function retryFailed(): Promise<void> {
       </div>
     </section>
 
-    <section v-if="report && !uploading" class="report-panel">
-      <header>
-        <div><p class="eyebrow">Resultado</p><h2>Carga finalizada</h2></div>
-        <div class="report-actions">
+  </main>
+
+  <Teleport to="body">
+    <div v-if="confirming" class="operation-overlay" @click.self="closeConfirmation" @keydown="onDialogKeydown">
+      <section class="operation-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-upload-title">
+        <div class="dialog-content">
+          <p class="dialog-eyebrow">Confirmación final</p>
+          <h2 id="confirm-upload-title">Confirmar carga</h2>
+          <p>Se cargarán {{ uploads.length }} {{ uploads.length === 1 ? 'archivo nuevo' : 'archivos nuevos' }} y se {{ replacements.length === 1 ? 'reemplazará' : 'reemplazarán' }} {{ replacements.length }}.</p>
+          <div v-if="replacements.length" class="replacement-note">
+            <strong>Archivos que se reemplazarán</strong>
+            <ul>
+              <li v-for="item in replacements" :key="item.id">{{ item.relativePath }}</li>
+            </ul>
+            <p>Antes de reemplazar cada archivo, se guarda una copia del anterior.</p>
+          </div>
+          <p>Ningún archivo remoto será eliminado.</p>
+        </div>
+        <footer class="dialog-actions">
+          <button ref="confirmCancelButton" class="btn btn-secondary" @click="closeConfirmation">Volver</button>
+          <button class="btn btn-primary" @click="runUpload([...actionItems])">Confirmar carga</button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="showReport && report && !uploading" class="operation-overlay" @click.self="closeReport" @keydown="onDialogKeydown">
+      <section class="operation-dialog" role="dialog" aria-modal="true" aria-labelledby="upload-result-title">
+        <div class="dialog-content">
+          <p class="dialog-eyebrow">Resultado</p>
+          <h2 id="upload-result-title">{{ reportHasIssues ? 'Carga con problemas' : 'Carga terminada' }}</h2>
+          <p>{{ reportHasIssues ? 'Revisá los archivos que no se cargaron.' : 'La carga terminó y se verificó el contenido en OBS.' }}</p>
+          <p v-if="report.totals.replaced">Cada archivo reemplazado conserva una copia de la versión anterior.</p>
+          <div class="report-totals">
+            <span>{{ countLabel(report.totals.uploaded, 'cargado', 'cargados') }}</span>
+            <span>{{ countLabel(report.totals.replaced, 'reemplazado', 'reemplazados') }}</span>
+            <span>{{ countLabel(report.totals.identical, 'idéntico', 'idénticos') }}</span>
+            <span>{{ countLabel(report.totals.kept, 'conservado', 'conservados') }}</span>
+            <span :class="{ failed: report.totals.invalid }">{{ countLabel(report.totals.invalid, 'inválido', 'inválidos') }}</span>
+            <span :class="{ failed: report.totals.failed }">{{ countLabel(report.totals.failed, 'fallido', 'fallidos') }}</span>
+          </div>
+          <details v-if="reportHasIssues" class="report-problems" open>
+            <summary>Archivos con problemas</summary>
+            <p v-for="entry in report.entries.filter(item => item.action === 'failed' || item.action === 'invalid')" :key="entry.relativePath">
+              <strong>{{ entry.relativePath }}</strong> — {{ entry.message }}
+            </p>
+          </details>
+        </div>
+        <footer class="dialog-actions">
           <button class="btn btn-secondary" @click="saveReport">Guardar informe</button>
           <button v-if="report.totals.failed" class="btn btn-primary" @click="retryFailed">Reintentar fallidos</button>
+          <button ref="reportCloseButton" class="btn btn-primary" @click="closeReport">Cerrar</button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="operationError" class="operation-overlay" @keydown="onDialogKeydown">
+      <section class="operation-dialog" role="alertdialog" aria-modal="true" aria-labelledby="operation-error-title" aria-describedby="operation-error-message">
+        <div class="dialog-content">
+          <p class="dialog-eyebrow error">No se completó</p>
+          <h2 id="operation-error-title">{{ operationError.title }}</h2>
+          <p id="operation-error-message">{{ operationError.message }}</p>
         </div>
-      </header>
-      <div class="report-totals">
-        <span>{{ report.totals.uploaded }} cargados</span>
-        <span>{{ report.totals.replaced }} reemplazados</span>
-        <span>{{ report.totals.identical }} idénticos</span>
-        <span>{{ report.totals.kept }} conservados</span>
-        <span :class="{ failed: report.totals.invalid }">{{ report.totals.invalid }} inválidos</span>
-        <span :class="{ failed: report.totals.failed }">{{ report.totals.failed }} fallidos</span>
-      </div>
-      <details v-if="report.totals.failed || report.totals.invalid">
-        <summary>Ver problemas</summary>
-        <p v-for="entry in report.entries.filter(item => item.action === 'failed' || item.action === 'invalid')" :key="entry.relativePath">
-          <strong>{{ entry.relativePath }}</strong> — {{ entry.message }}
-        </p>
-      </details>
-    </section>
-  </main>
+        <footer class="dialog-actions">
+          <button ref="errorCloseButton" class="btn btn-primary" @click="closeOperationError">Entendido</button>
+        </footer>
+      </section>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -534,7 +651,8 @@ async function retryFailed(): Promise<void> {
 .path-row span { @apply truncate text-sm text-slate-700 dark:text-slate-200; }
 .path-row .placeholder { @apply text-slate-400; }
 .analyze-btn { @apply h-10 whitespace-nowrap px-5; }
-.progress-card, .upload-panel, .report-panel, .confirmation-panel { @apply rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800; }
+.progress-card, .upload-panel { @apply rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-800; }
+.result-link { @apply text-sm font-semibold text-sky-700 underline-offset-4 hover:underline dark:text-sky-300; }
 .progress-copy, .upload-heading { @apply flex items-center justify-between gap-4; }
 .progress-card p { @apply mt-2 truncate text-sm text-slate-500; }
 .progress-track { @apply mt-3 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700; }
@@ -549,8 +667,8 @@ async function retryFailed(): Promise<void> {
 .muted-copy { @apply text-sm text-slate-500; }
 .conflicts-panel { @apply overflow-hidden rounded-2xl border border-amber-300 bg-white dark:border-amber-800 dark:bg-slate-800; }
 .conflicts-panel > header { @apply flex items-start justify-between gap-6 border-b border-amber-200 bg-amber-50 p-5 dark:border-amber-900 dark:bg-amber-950/30; }
-.conflicts-panel h2, .confirmation-panel h2, .upload-panel h2, .report-panel h2 { @apply text-xl font-semibold text-slate-950 dark:text-white; }
-.conflicts-panel header p:not(.eyebrow), .confirmation-panel p { @apply mt-1 text-sm text-slate-600 dark:text-slate-400; }
+.conflicts-panel h2, .upload-panel h2 { @apply text-xl font-semibold text-slate-950 dark:text-white; }
+.conflicts-panel header p:not(.eyebrow) { @apply mt-1 text-sm text-slate-600 dark:text-slate-400; }
 .bulk-actions { @apply flex shrink-0 gap-2; }
 .btn-outline-warning { @apply border border-amber-500 text-amber-800 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-950; }
 .conflict-list { @apply max-h-80 divide-y divide-slate-200 overflow-y-auto dark:divide-slate-700; }
@@ -564,20 +682,30 @@ async function retryFailed(): Promise<void> {
 .decision.replace.active { @apply text-amber-700 dark:text-amber-300; }
 .action-bar { @apply flex items-center justify-between rounded-2xl bg-slate-950 p-5 text-white dark:bg-sky-950; }
 .action-bar p { @apply mt-1 text-sm text-slate-400; }
-.confirmation-panel { @apply flex items-center justify-between gap-5 border-sky-400; }
-.confirmation-actions, .report-actions { @apply flex shrink-0 gap-3; }
 .upload-heading strong { @apply text-3xl text-sky-500; }
 .progress-track.large { @apply h-3; }
 .upload-metrics { @apply mt-3 flex justify-between text-sm text-slate-500; }
-.report-panel header { @apply flex items-center justify-between; }
+.operation-overlay { @apply fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/75 p-4; }
+.operation-dialog { @apply w-full max-w-xl overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 text-slate-100 shadow-2xl; }
+.dialog-content { @apply max-h-[70vh] space-y-4 overflow-y-auto p-6; }
+.dialog-eyebrow { @apply text-xs font-bold uppercase tracking-[0.16em] text-sky-400; }
+.dialog-eyebrow.error { @apply text-red-400; }
+.dialog-content h2 { @apply text-2xl font-semibold; }
+.dialog-content > p:not(.dialog-eyebrow) { @apply text-sm leading-6 text-slate-300; }
+.dialog-actions { @apply flex flex-wrap justify-end gap-3 border-t border-slate-700 px-6 py-4; }
+.replacement-note { @apply space-y-2 rounded-xl border border-amber-800 bg-amber-950/30 p-4 text-sm text-amber-100; }
+.replacement-note ul { @apply max-h-32 list-disc space-y-1 overflow-y-auto pl-5; }
+.replacement-note li { @apply break-all; }
+.replacement-note p { @apply text-amber-200; }
 .report-totals { @apply mt-4 flex flex-wrap gap-2; }
-.report-totals span { @apply rounded-full bg-slate-100 px-3 py-1 text-sm dark:bg-slate-700; }
-.report-totals span.failed { @apply bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300; }
-.report-panel details { @apply mt-4 rounded-xl bg-red-50 p-4 text-sm text-red-800 dark:bg-red-950/40 dark:text-red-200; }
-.report-panel details p { @apply mt-2; }
+.report-totals span { @apply rounded-full bg-slate-800 px-3 py-1 text-sm text-slate-200; }
+.report-totals span.failed { @apply bg-red-950 text-red-300; }
+.report-problems { @apply rounded-xl border border-red-900 bg-red-950/40 p-4 text-sm text-red-200; }
+.report-problems summary { @apply cursor-pointer font-semibold; }
+.report-problems p { @apply mt-2 break-words; }
 @media (max-width: 900px) {
   .setup-panel { @apply grid-cols-1; }
   .summary-grid { @apply grid-cols-2; }
-  .conflicts-panel > header, .conflict-row, .confirmation-panel { @apply flex-col items-stretch; }
+  .conflicts-panel > header, .conflict-row { @apply flex-col items-stretch; }
 }
 </style>
