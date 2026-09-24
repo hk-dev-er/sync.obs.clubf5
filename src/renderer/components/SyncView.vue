@@ -78,6 +78,7 @@ watch(
       musicFolders.value = []
       loadingMusicFolders.value = false
       configStore.setAvailableDestinations([])
+      resetAnalysis()
     }
   },
   { immediate: true }
