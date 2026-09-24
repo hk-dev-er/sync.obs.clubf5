@@ -187,6 +187,9 @@ describe('uploader account and resumable transfer', () => {
     const directPut = calls.find(call => call.url.startsWith('https://bucket.obs.'))
     expect(directPut?.init?.method).toBe('PUT')
     expect(directPut?.init?.headers).toMatchObject({ 'Content-MD5': contentMd5 })
+    // OBS includes Content-Type in its signature. Adding an unsigned default
+    // makes the direct PUT fail with SignatureDoesNotMatch.
+    expect(directPut?.init?.headers).not.toHaveProperty('Content-Type')
     expect(directPut?.init?.headers).not.toHaveProperty('Authorization')
     vi.unstubAllGlobals()
   })
