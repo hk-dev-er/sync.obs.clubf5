@@ -1,18 +1,16 @@
 import type { DestinationPrefix } from './uploadPolicy'
 import type { LocalAudioFile, RemoteAudioFile } from './syncPlan'
 
-export interface OBSConfigInput {
-  accessKeyId: string
-  secretAccessKey: string
-  endpoint: string
-  bucket: string
+export interface OperatorLogin {
+  username: string
+  password: string
 }
 
-export interface OBSConfigStatus {
+export interface OperatorStatus {
   configured: boolean
-  endpoint: string
-  bucket: string
-  accessKeyIdHint: string
+  username: string
+  displayName: string
+  tenantId: number | null
 }
 
 export interface LocalScanResult {
@@ -76,5 +74,6 @@ export interface UploadReport {
 }
 
 export interface RemoteObjectMetadata extends RemoteAudioFile {
+  jobId?: string | null
   metadata: Record<string, string>
 }

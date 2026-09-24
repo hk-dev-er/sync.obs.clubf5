@@ -1,342 +1,342 @@
-// Huawei OBS runs only in Electron's main process.
-// The SDK does not ship complete TypeScript declarations.
-// @ts-nocheck
-import ObsClient from 'esdk-obs-nodejs'
 import type { IpcMainInvokeEvent } from 'electron'
-import * as fs from 'fs/promises'
-import type {
-  OBSConfigInput,
-  RemoteObjectMetadata,
-  UploadProgress,
-  UploadRequest,
-  UploadResult
-} from '../shared/contracts'
+import { createHash, randomUUID } from 'crypto'
+import { createReadStream } from 'fs'
+import { stat } from 'fs/promises'
+import type { OperatorLogin, OperatorStatus, RemoteObjectMetadata, UploadProgress,
+  UploadRequest, UploadResult } from '../shared/contracts'
 import type { RemoteAudioFile } from '../shared/syncPlan'
-import {
-  buildBackupKey,
-  buildObjectKey,
-  destinationFromObjectKey,
-  type DestinationPrefix,
-  isAllowedDestination,
-  musicDestinationsFromCommonPrefixes,
-  MUSIC_ROOT
-} from '../shared/uploadPolicy'
+import { buildObjectKey, isAllowedDestination, type DestinationPrefix } from '../shared/uploadPolicy'
 import { hashAndValidateOgg, validateLocalAudioPath } from './fileSystem'
-import { loadOBSConfig, saveOBSConfig } from './configService'
+import { clearOperatorRefresh, loadOperatorRefresh, saveOperatorRefresh } from './configService'
 
-let obsClient: InstanceType<typeof ObsClient> | null = null
-let currentConfig: OBSConfigInput | null = null
-let discoveredMusicFolders = new Set<DestinationPrefix>()
-let connectionGeneration = 0
+const API_ROOT = 'https://api.clubf5.com/api'
+const API_TIMEOUT_MS = 30_000
 
-function createClient(config: OBSConfigInput): InstanceType<typeof ObsClient> {
-  return new ObsClient({
-    access_key_id: config.accessKeyId,
-    secret_access_key: config.secretAccessKey,
-    server: config.endpoint
+interface TokenPair { access_token: string; refresh_token: string }
+interface Account { username: string; tenantId: number; displayName: string; allowedPrefixes: string[] }
+interface Session { id: string; expiresAt: string }
+interface Job {
+  id: string; clientFileId: string; objectKey: string; sizeBytes: number; sha256: string
+  partSizeBytes: number; partCount: number; replaceExisting: boolean
+  previousETag: string | null; backupKey: string | null; status: string
+}
+interface RemoteMetadata { sizeBytes: number; eTag: string; sha256: string | null;
+  jobId: string | null; lastModified: string | null }
+interface Part { number: number; sizeBytes: number; eTag: string }
+
+class ApiError extends Error {
+  constructor(readonly status: number, code: string) {
+    super(`ClubF5 rechazó la operación: ${code}`)
+  }
+}
+
+let accessToken: string | null = null
+let refreshInFlight: Promise<void> | null = null
+let allowedFolders = new Set<DestinationPrefix>()
+
+function apiUrl(path: string): string { return `${API_ROOT}${path}` }
+
+async function readJson<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    let code = `HTTP ${response.status}`
+    try {
+      const body = await response.json() as { error?: string }
+      if (body.error) code = body.error
+    } catch { /* Keep the status without exposing server internals. */ }
+    throw new ApiError(response.status, code)
+  }
+  return response.json() as Promise<T>
+}
+
+async function rawApi(path: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(apiUrl(path), { ...init, signal: AbortSignal.timeout(API_TIMEOUT_MS) })
+}
+
+async function rotateToken(): Promise<void> {
+  const saved = loadOperatorRefresh()
+  if (!saved) throw new Error('Iniciá sesión con tu usuario de carga')
+  const response = await rawApi('/token/music-uploader-refresh', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(saved)
   })
-}
-
-function validateConfig(config: OBSConfigInput): void {
-  if (!config.accessKeyId.trim() || !config.secretAccessKey.trim() || !config.bucket.trim()) {
-    throw new Error('Completá Access Key, Secret Key y bucket')
+  if (response.status === 401) {
+    clearOperatorRefresh()
+    accessToken = null
+    throw new Error('La sesión terminó o el operador fue deshabilitado. Iniciá sesión nuevamente.')
   }
-  const endpoint = new URL(config.endpoint)
-  if (endpoint.protocol !== 'https:') throw new Error('El endpoint OBS debe usar HTTPS')
+  const pair = await readJson<TokenPair>(response)
+  if (!pair.access_token || !pair.refresh_token) throw new Error('Respuesta de sesión incompleta')
+  saveOperatorRefresh(saved.username, pair.refresh_token)
+  accessToken = pair.access_token
 }
 
-async function headBucket(client: InstanceType<typeof ObsClient>, bucket: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    client.headBucket({ Bucket: bucket }, (error, result) => {
-      resolve(!error && result?.CommonMsg?.Status === 200)
-    })
+async function refreshOnce(): Promise<void> {
+  refreshInFlight ??= rotateToken().finally(() => { refreshInFlight = null })
+  await refreshInFlight
+}
+
+async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  if (!accessToken) await refreshOnce()
+  const request = () => rawApi(path, {
+    method,
+    headers: { Authorization: `Bearer ${accessToken}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) })
   })
-}
-
-async function configure(config: OBSConfigInput): Promise<boolean> {
-  validateConfig(config)
-  const candidate = createClient(config)
-  const connected = await headBucket(candidate, config.bucket)
-  if (!connected) {
-    candidate.close?.()
-    return false
+  let response = await request()
+  if (response.status === 401) {
+    await refreshOnce()
+    response = await request()
   }
-
-  obsClient?.close?.()
-  obsClient = candidate
-  currentConfig = { ...config }
-  discoveredMusicFolders = new Set()
-  connectionGeneration += 1
-  saveOBSConfig(config)
-  return true
+  if (response.status === 204) return undefined as T
+  return readJson<T>(response)
 }
 
-async function connectStored(): Promise<boolean> {
-  const config = loadOBSConfig()
-  if (!config) return false
-  validateConfig(config)
-  const client = createClient(config)
-  if (!(await headBucket(client, config.bucket))) {
-    client.close?.()
-    return false
+async function getAccount(): Promise<Account> {
+  const next = await api<Account>('/music-uploader/me')
+  allowedFolders = new Set(next.allowedPrefixes.filter(isAllowedDestination))
+  return next
+}
+
+function status(value: Account): OperatorStatus {
+  return { configured: true, username: value.username,
+    displayName: value.displayName, tenantId: value.tenantId }
+}
+
+async function login(credentials: OperatorLogin): Promise<OperatorStatus> {
+  if (!credentials.username.trim() || !credentials.password) throw new Error('Completá usuario y contraseña')
+  const response = await rawApi('/token/login', {
+    method: 'POST',
+    headers: { Authorization: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`,
+      'Content-Type': 'application/json' }, body: JSON.stringify({ admin: 0 })
+  })
+  const pair = await readJson<TokenPair>(response)
+  if (!pair.access_token || !pair.refresh_token) throw new Error('Respuesta de sesión incompleta')
+  accessToken = pair.access_token
+  try {
+    const value = await getAccount() // A normal ClubF5 user cannot use this app.
+    saveOperatorRefresh(value.username, pair.refresh_token)
+    return status(value)
+  } catch (error) {
+    accessToken = null
+    throw error
   }
-  obsClient?.close?.()
-  obsClient = client
-  currentConfig = config
-  discoveredMusicFolders = new Set()
-  connectionGeneration += 1
-  return true
 }
 
-function requireConnection(): { client: InstanceType<typeof ObsClient>; config: OBSConfigInput } {
-  if (!obsClient || !currentConfig) throw new Error('OBS no está conectado')
-  return { client: obsClient, config: currentConfig }
+async function connectStored(): Promise<OperatorStatus | null> {
+  if (!loadOperatorRefresh()) return null
+  await refreshOnce()
+  return status(await getAccount())
 }
 
-function requireDiscoveredDestination(value: string): DestinationPrefix {
-  if (!isAllowedDestination(value) || !discoveredMusicFolders.has(value)) {
-    throw new Error('La carpeta musical ya no está disponible. Actualizá la lista de destinos.')
-  }
-  return value
-}
-
-function assertSafeKey(key: string): DestinationPrefix {
-  const destination = destinationFromObjectKey(key)
-  if (!destination || !discoveredMusicFolders.has(destination) || !key.toLowerCase().endsWith('.ogg')) {
-    throw new Error('La ruta OBS no está autorizada')
-  }
-  return destination
-}
-
-function cleanEtag(value: unknown): string | null {
-  if (typeof value !== 'string' || !value.trim()) return null
-  return value.trim().replace(/^"|"$/g, '').toLowerCase()
-}
-
-async function listAllObjects(prefix: string): Promise<RemoteAudioFile[]> {
-  const destination = requireDiscoveredDestination(prefix)
-  const { client, config } = requireConnection()
-  const objects: RemoteAudioFile[] = []
-
-  const listPage = async (marker?: string): Promise<void> => {
-    const result = await new Promise((resolve, reject) => {
-      const params: Record<string, unknown> = { Bucket: config.bucket, Prefix: destination, MaxKeys: 1000 }
-      if (marker) params.Marker = marker
-      client.listObjects(params, (error, response) => error ? reject(error) : resolve(response))
-    })
-
-    if (result.CommonMsg.Status !== 200) {
-      throw new Error(`OBS no pudo listar la carpeta: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
+async function logout(): Promise<void> {
+  const saved = loadOperatorRefresh()
+  try {
+    if (saved) {
+      // A logout revokes all active upload sessions, not just the short JWT.
+      for (const session of await api<Session[]>('/music-uploader/sessions')) {
+        await api<void>(`/music-uploader/sessions/${session.id}`, 'DELETE')
+      }
+      const response = await rawApi('/token/logout', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(saved) })
+      if (!response.ok) throw new ApiError(response.status, 'logout_not_confirmed')
     }
-
-    for (const object of result.InterfaceResult.Contents ?? []) {
-      if (object.Key === destination || object.Key.endsWith('/') || !object.Key.toLowerCase().endsWith('.ogg')) continue
-      objects.push({
-        key: object.Key,
-        relativePath: object.Key.slice(destination.length).normalize('NFC'),
-        size: Number(object.Size),
-        etag: cleanEtag(object.ETag),
-        lastModified: object.LastModified ?? null
-      })
-    }
-
-    if (result.InterfaceResult.IsTruncated && result.InterfaceResult.NextMarker) {
-      await listPage(result.InterfaceResult.NextMarker)
-    }
+  } finally {
+    clearOperatorRefresh()
+    accessToken = null
+    allowedFolders = new Set()
   }
-
-  await listPage()
-  return objects
 }
 
 async function listMusicFolders(): Promise<DestinationPrefix[]> {
-  const { client, config } = requireConnection()
-  const generation = connectionGeneration
-  const folders = new Set<DestinationPrefix>()
-
-  const listPage = async (marker?: string): Promise<void> => {
-    const result = await new Promise((resolve, reject) => {
-      const params: Record<string, unknown> = {
-        Bucket: config.bucket,
-        Prefix: MUSIC_ROOT,
-        Delimiter: '/',
-        MaxKeys: 1000
-      }
-      if (marker) params.Marker = marker
-      client.listObjects(params, (error, response) => error ? reject(error) : resolve(response))
-    })
-
-    if (result.CommonMsg.Status !== 200) {
-      throw new Error(`OBS no pudo listar las carpetas musicales: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
-    }
-
-    for (const prefix of musicDestinationsFromCommonPrefixes(result.InterfaceResult.CommonPrefixes ?? [])) {
-      folders.add(prefix)
-    }
-
-    if (result.InterfaceResult.IsTruncated && result.InterfaceResult.NextMarker) {
-      await listPage(result.InterfaceResult.NextMarker)
-    }
-  }
-
-  await listPage()
-  if (generation !== connectionGeneration) {
-    throw new Error('La conexión OBS cambió mientras se consultaban las carpetas. Actualizá la lista.')
-  }
-  const ordered = [...folders].sort((left, right) => left.localeCompare(right, 'es', { sensitivity: 'base' }))
-  discoveredMusicFolders = new Set(ordered)
-  return ordered
+  await getAccount()
+  return [...allowedFolders].sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }))
 }
 
-async function assertDestinationStillExists(destination: DestinationPrefix): Promise<void> {
-  const { client, config } = requireConnection()
-  const result = await new Promise((resolve, reject) => {
-    client.listObjects({
-      Bucket: config.bucket,
-      Prefix: destination,
-      MaxKeys: 1
-    }, (error, response) => error ? reject(error) : resolve(response))
-  })
+function requireFolder(prefix: string): DestinationPrefix {
+  if (!isAllowedDestination(prefix) || !allowedFolders.has(prefix)) {
+    throw new Error('La carpeta ya no está autorizada. Actualizá la lista.')
+  }
+  return prefix
+}
 
-  if (result.CommonMsg.Status !== 200) {
-    throw new Error(`OBS no pudo verificar la carpeta musical: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
-  }
-  if (!(result.InterfaceResult.Contents ?? []).some(item => item.Key?.startsWith(destination))) {
-    discoveredMusicFolders.delete(destination)
-    throw new Error('La carpeta musical dejó de existir en OBS. No se creó ninguna carpeta nueva.')
-  }
+function cleanEtag(value: string | null | undefined): string | null {
+  return value?.trim().replace(/^"|"$/g, '').toLowerCase() ?? null
+}
+
+async function listAllObjects(value: string): Promise<RemoteAudioFile[]> {
+  await getAccount()
+  const prefix = requireFolder(value)
+  const files: RemoteAudioFile[] = []
+  let marker: string | null = null
+  do {
+    const query = new URLSearchParams({ prefix })
+    if (marker) query.set('marker', marker)
+    const page = await api<{ objects: Array<{ key: string; sizeBytes: number; eTag: string;
+      lastModified: string | null }>; nextMarker: string | null }>(`/music-uploader/objects?${query}`)
+    for (const item of page.objects) {
+      if (!item.key.startsWith(prefix) || item.key.endsWith('/') || !item.key.toLowerCase().endsWith('.ogg')) continue
+      files.push({ key: item.key, relativePath: item.key.slice(prefix.length).normalize('NFC'),
+        size: item.sizeBytes, etag: cleanEtag(item.eTag), lastModified: item.lastModified })
+    }
+    if (page.nextMarker && page.nextMarker === marker) throw new Error('La lista remota no avanzó')
+    marker = page.nextMarker
+  } while (marker)
+  return files
 }
 
 async function getMetadata(key: string): Promise<RemoteObjectMetadata | null> {
-  const prefix = assertSafeKey(key)
-  const { client, config } = requireConnection()
+  await getAccount()
+  const prefix = [...allowedFolders].find(folder => key.startsWith(folder))
+  if (!prefix || !key.toLowerCase().endsWith('.ogg')) throw new Error('Archivo fuera de las carpetas autorizadas')
+  try {
+    const item = await api<RemoteMetadata>(`/music-uploader/objects/metadata?key=${encodeURIComponent(key)}`)
+    return { key, relativePath: key.slice(prefix.length), size: item.sizeBytes,
+      etag: cleanEtag(item.eTag), sha256: item.sha256, jobId: item.jobId,
+      lastModified: item.lastModified,
+      metadata: item.sha256 ? { sha256: item.sha256 } : {} }
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null
+    throw error
+  }
+}
 
-  return new Promise((resolve, reject) => {
-    client.getObjectMetadata({ Bucket: config.bucket, Key: key }, (error, result) => {
-      const status = result?.CommonMsg?.Status
-      if (status === 404) return resolve(null)
-      if (error) return reject(error)
-      if (status !== 200) {
-        return reject(new Error(`OBS no pudo consultar el archivo: ${result?.CommonMsg?.Message ?? status}`))
-      }
+async function sessionFor(request: UploadRequest, key: string): Promise<{ session: Session; job: Job | null }> {
+  const sessions = await api<Session[]>('/music-uploader/sessions')
+  for (const session of sessions) {
+    const result = await api<{ jobs: Job[] }>(`/music-uploader/sessions/${session.id}/jobs`)
+    const job = result.jobs.find(item => item.objectKey === key && item.sizeBytes === request.digest.size
+      && item.sha256?.toLowerCase() === request.digest.sha256.toLowerCase()
+      && item.replaceExisting === request.allowReplace
+      && (!request.allowReplace || cleanEtag(item.previousETag) === cleanEtag(request.expectedRemote?.etag))
+      && (item.status === 'uploading' || item.status === 'completing' || item.status === 'completed'))
+    if (job) return { session, job }
+  }
+  return { session: sessions[0] ?? await api<Session>('/music-uploader/sessions', 'POST'), job: null }
+}
 
-      const metadata = result.InterfaceResult.Metadata ?? {}
-      resolve({
-        key,
-        relativePath: key.slice(prefix.length),
-        size: Number(result.InterfaceResult.ContentLength),
-        etag: cleanEtag(result.InterfaceResult.ETag),
-        sha256: metadata.sha256 ?? metadata.Sha256 ?? null,
-        lastModified: result.InterfaceResult.LastModified ?? null,
-        metadata
-      })
+async function partMd5(file: string, start: number, size: number): Promise<string> {
+  const hash = createHash('md5')
+  for await (const chunk of createReadStream(file, { start, end: start + size - 1 })) hash.update(chunk)
+  return hash.digest('base64')
+}
+
+async function sendPart(file: string, job: Job, sessionId: string, number: number,
+  contentMd5: string): Promise<void> {
+  const start = (number - 1) * job.partSizeBytes
+  const size = Math.min(job.partSizeBytes, job.sizeBytes - start)
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const signed = await api<{ url: string; headers: Record<string, string>; expectedBytes: number }>(
+      `/music-uploader/sessions/${sessionId}/files/${job.id}/parts/${number}/url`, 'POST', { contentMd5 })
+    const signedHost = new URL(signed.url)
+    if (signed.expectedBytes !== size || signedHost.protocol !== 'https:'
+      || !signedHost.hostname.endsWith('.myhuaweicloud.com')
+      || !Object.keys(signed.headers).some(name => name.toLowerCase() === 'content-md5')) {
+      throw new Error('ClubF5 devolvió una URL de carga inesperada')
+    }
+    let response: Response
+    try {
+      response = await fetch(signed.url, { method: 'PUT', headers: { ...signed.headers,
+        'Content-Length': String(size) },
+        body: createReadStream(file, { start, end: start + size - 1 }) as unknown as BodyInit,
+        duplex: 'half', signal: AbortSignal.timeout(15 * 60_000) } as RequestInit & { duplex: 'half' })
+    } catch {
+      if (attempt === 2) throw new Error(`No se pudo enviar la parte ${number}. Se puede reanudar más tarde.`)
+      continue
+    }
+    if (response.ok) return
+    await response.arrayBuffer() // Drain without logging the signed URL or private response.
+    if (attempt === 2 || ![403, 408, 429, 500, 502, 503, 504].includes(response.status)) {
+      throw new Error(`OBS rechazó la parte ${number}: HTTP ${response.status}`)
+    }
+  }
+}
+
+async function uploadFile(event: IpcMainInvokeEvent, request: UploadRequest): Promise<UploadResult> {
+  await getAccount()
+  const destination = requireFolder(request.destination)
+  const key = buildObjectKey(destination, request.relativePath)
+  const file = await validateLocalAudioPath(request.localPath, request.relativePath)
+  const size = (await stat(file)).size
+  const digest = await hashAndValidateOgg(file)
+  if (size !== request.digest.size || digest.sha256 !== request.digest.sha256 || digest.md5 !== request.digest.md5) {
+    throw new Error('El archivo local cambió desde la comparación. Compará nuevamente.')
+  }
+  const resumed = await sessionFor(request, key)
+  if (resumed.job?.status === 'completing') {
+    resumed.job = await api<Job>(
+      `/music-uploader/sessions/${resumed.session.id}/files/${resumed.job.id}/complete`, 'POST')
+  }
+  if (resumed.job?.status === 'completed') {
+    const published = await getMetadata(key)
+    if (published?.size === size && published.sha256?.toLowerCase() === digest.sha256
+      && published.jobId?.toLowerCase() === resumed.job.id.toLowerCase()) {
+      return { key, replaced: request.allowReplace, backupKey: resumed.job.backupKey,
+        verified: true, etag: published.etag }
+    }
+    // The completed object may have been removed later. Do not reuse its old job.
+    resumed.job = null
+  }
+  const remote = await getMetadata(key)
+  if (remote && !request.allowReplace) throw new Error('El archivo apareció en OBS. Compará nuevamente.')
+  if (!remote && request.allowReplace) throw new Error('El archivo remoto desapareció. Compará nuevamente.')
+  if (remote && request.allowReplace && (!request.expectedRemote
+    || request.expectedRemote.size !== remote.size
+    || cleanEtag(request.expectedRemote.etag) !== cleanEtag(remote.etag))) {
+    throw new Error('El archivo remoto cambió. Compará nuevamente.')
+  }
+
+  const session = resumed.session
+  let job = resumed.job
+  if (!job) {
+    job = await api<Job>(`/music-uploader/sessions/${session.id}/files`, 'POST', {
+      clientFileId: randomUUID(), prefix: destination, relativePath: request.relativePath,
+      sizeBytes: size, sha256: digest.sha256, replaceExisting: request.allowReplace,
+      expectedRemote: remote ? { sizeBytes: remote.size, eTag: remote.etag } : null
     })
-  })
-}
-
-async function copyForBackup(sourceKey: string, backupKey: string): Promise<void> {
-  const { client, config } = requireConnection()
-  const result = await new Promise((resolve, reject) => {
-    client.copyObject({
-      Bucket: config.bucket,
-      Key: backupKey,
-      CopySource: `${config.bucket}/${sourceKey}`,
-      MetadataDirective: client.enums?.CopyMetadata
-    }, (error, response) => error ? reject(error) : resolve(response))
-  })
-  if (result.CommonMsg.Status >= 300) {
-    throw new Error(`No se pudo respaldar el archivo anterior: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
-  }
-}
-
-async function putFile(event: IpcMainInvokeEvent, request: UploadRequest): Promise<UploadResult> {
-  const { client, config } = requireConnection()
-  const destination = requireDiscoveredDestination(request.destination)
-  await assertDestinationStillExists(destination)
-  const key = buildObjectKey(request.destination, request.relativePath)
-  const localPath = await validateLocalAudioPath(request.localPath, request.relativePath)
-  const stats = await fs.stat(localPath)
-  const digest = await hashAndValidateOgg(localPath)
-
-  if (stats.size !== request.digest.size || digest.md5 !== request.digest.md5 || digest.sha256 !== request.digest.sha256) {
-    throw new Error('El archivo local cambió después de la comparación. Volvé a analizar la carpeta.')
   }
 
-  const current = await getMetadata(key)
-  if (current && !request.allowReplace) {
-    throw new Error('El archivo apareció en OBS después de la comparación. No se reemplazó.')
-  }
-  if (!current && request.allowReplace) {
-    throw new Error('El archivo que ibas a reemplazar ya no existe. Volvé a analizar la carpeta.')
-  }
-  if (current && request.allowReplace) {
-    const expected = request.expectedRemote
-    if (!expected || expected.size !== current.size || cleanEtag(expected.etag) !== cleanEtag(current.etag)) {
-      throw new Error('El archivo de OBS cambió después de la comparación. No se reemplazó.')
-    }
-  }
-
-  let backupKey: string | null = null
-  if (current) {
-    backupKey = buildBackupKey(request.destination, request.relativePath, new Date().toISOString())
-    await copyForBackup(key, backupKey)
-    const afterBackup = await getMetadata(key)
-    if (!afterBackup || afterBackup.size !== current.size || cleanEtag(afterBackup.etag) !== cleanEtag(current.etag)) {
-      throw new Error('El archivo de OBS cambió mientras se preparaba el respaldo. No se reemplazó.')
-    }
-  }
-
-  const result = await new Promise((resolve, reject) => {
-    client.putObject({
-      Bucket: config.bucket,
-      Key: key,
-      SourceFile: localPath,
-      ContentLength: stats.size,
-      Metadata: { sha256: digest.sha256 },
-      ProgressCallback: (transferredAmount, totalAmount, totalSeconds) => {
-        event.sender.send('obs:uploadProgress', {
-          transferId: request.transferId,
-          transferred: Number(transferredAmount),
-          total: Number(totalAmount || stats.size),
-          elapsedSeconds: Number(totalSeconds || 0)
-        } satisfies UploadProgress)
+  const started = Date.now()
+  if (job.status !== 'completed') {
+    const state = await api<{ job: Job; parts: Part[] }>(
+      `/music-uploader/sessions/${session.id}/files/${job.id}`)
+    job = state.job
+    if (job.status === 'uploading') {
+      const uploaded = new Map(state.parts.map(part => [part.number, part]))
+      let transferred = 0
+      for (let number = 1; number <= job.partCount; number += 1) {
+        const expected = Math.min(job.partSizeBytes, size - (number - 1) * job.partSizeBytes)
+        const md5 = await partMd5(file, (number - 1) * job.partSizeBytes, expected)
+        const prior = uploaded.get(number)
+        if (prior?.sizeBytes !== expected || cleanEtag(prior.eTag) !== Buffer.from(md5, 'base64').toString('hex')) {
+          await sendPart(file, job, session.id, number, md5)
+        }
+        transferred += expected
+        event.sender.send('obs:uploadProgress', { transferId: request.transferId, transferred,
+          total: size, elapsedSeconds: (Date.now() - started) / 1000 } satisfies UploadProgress)
       }
-    }, (error, response) => error ? reject(error) : resolve(response))
-  })
-
-  if (result.CommonMsg.Status >= 300) {
-    throw new Error(`OBS rechazó la carga: ${result.CommonMsg.Message ?? result.CommonMsg.Status}`)
+      job = await api<Job>(`/music-uploader/sessions/${session.id}/files/${job.id}/complete`, 'POST')
+    }
+    if (job.status === 'completing') {
+      job = await api<Job>(`/music-uploader/sessions/${session.id}/files/${job.id}/complete`, 'POST')
+    }
   }
-
-  const uploaded = await getMetadata(key)
-  const verified = Boolean(
-    uploaded && uploaded.size === stats.size && (
-      uploaded.sha256?.toLowerCase() === digest.sha256 ||
-      cleanEtag(uploaded.etag) === digest.md5
-    )
-  )
-  if (!verified) {
-    throw new Error('OBS recibió el archivo, pero no se pudo verificar su contenido. No continúes sin revisarlo.')
+  if (job.status !== 'completed') throw new Error('La carga no quedó confirmada. Podés reanudarla más tarde.')
+  const [published, after] = await Promise.all([getMetadata(key), hashAndValidateOgg(file)])
+  if (!published || published.size !== size || published.sha256?.toLowerCase() !== digest.sha256
+    || published.jobId?.toLowerCase() !== job.id.toLowerCase()
+    || after.sha256 !== digest.sha256) {
+    throw new Error('No se pudo confirmar el contenido final. No continúes sin revisarlo.')
   }
-
-  return {
-    key,
-    replaced: current !== null,
-    backupKey,
-    verified,
-    etag: uploaded?.etag ?? null
-  }
+  return { key, replaced: request.allowReplace, backupKey: job.backupKey,
+    verified: true, etag: published.etag }
 }
 
 export const obsHandlers: Record<string, (event: IpcMainInvokeEvent, ...args: any[]) => Promise<unknown>> = {
-  'obs:configure': async (_event, config: OBSConfigInput) => configure(config),
-  'obs:connectStored': async () => connectStored(),
-  'obs:testConnection': async () => {
-    const { client, config } = requireConnection()
-    return headBucket(client, config.bucket)
-  },
+  'auth:login': async (_event, credentials: OperatorLogin) => login(credentials),
+  'auth:connectStored': async () => connectStored(),
+  'auth:logout': async () => logout(),
   'obs:listMusicFolders': async () => listMusicFolders(),
   'obs:listAllObjects': async (_event, prefix: string) => listAllObjects(prefix),
   'obs:getObjectMetadata': async (_event, key: string) => getMetadata(key),
-  'obs:uploadFile': putFile
+  'obs:uploadFile': uploadFile
 }

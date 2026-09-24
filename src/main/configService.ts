@@ -1,27 +1,25 @@
 import Store from 'electron-store'
 import { app, safeStorage, type IpcMainInvokeEvent } from 'electron'
 import { mkdirSync } from 'fs'
-import type { OBSConfigInput, OBSConfigStatus } from '../shared/contracts'
+import type { OperatorStatus } from '../shared/contracts'
 import type { DestinationPrefix } from '../shared/uploadPolicy'
 import { isAllowedDestination } from '../shared/uploadPolicy'
 
 type Theme = 'light' | 'dark' | 'system'
 type PreferenceKey = 'localPath' | 'destination' | 'theme'
 
-interface SecureSettings {
-  obsEncrypted?: string
+interface Settings {
+  operatorUsername?: string
+  operatorRefreshEncrypted?: string
+  obsEncrypted?: string // Removed on upgrade from the AK/SK application.
   localPath?: string
   destination?: DestinationPrefix
   theme?: Theme
 }
 
-interface LegacySettings {
-  obs?: OBSConfigInput
-}
+interface LegacySettings { obs?: unknown }
 
-let storeInstance: Store<SecureSettings> | null = null
-let legacyStoreInstance: Store<LegacySettings> | null = null
-
+let storeInstance: Store<Settings> | null = null
 const preferenceKeys = new Set<PreferenceKey>(['localPath', 'destination', 'theme'])
 
 function ensureUserDataDirectory(): string {
@@ -30,74 +28,60 @@ function ensureUserDataDirectory(): string {
   return userData
 }
 
-function getStore(): Store<SecureSettings> {
+function getStore(): Store<Settings> {
   if (!storeInstance) {
-    storeInstance = new Store<SecureSettings>({
+    storeInstance = new Store<Settings>({
       cwd: ensureUserDataDirectory(),
       name: 'clubf5-uploader-settings',
-      defaults: {
-        destination: 'Music/online/Progressive/',
-        theme: 'system'
-      }
+      defaults: { destination: 'Music/online/Progressive/', theme: 'system' }
     })
+    // Do not keep legacy Huawei credentials after the app is upgraded.
+    storeInstance.delete('obsEncrypted')
+    const legacy = new Store<LegacySettings>({
+      cwd: ensureUserDataDirectory(), name: 'sync-obs-config',
+      encryptionKey: 'sync-obs-clubf5-secure-key'
+    })
+    legacy.delete('obs')
   }
   return storeInstance
 }
 
-function getLegacyStore(): Store<LegacySettings> {
-  if (!legacyStoreInstance) {
-    legacyStoreInstance = new Store<LegacySettings>({
-      cwd: ensureUserDataDirectory(),
-      name: 'sync-obs-config',
-      encryptionKey: 'sync-obs-clubf5-secure-key'
-    })
-  }
-  return legacyStoreInstance
-}
-
-function assertEncryptionAvailable(): void {
+function encryptionRequired(): void {
   if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('Windows no permite proteger la credencial en este momento')
+    throw new Error('No se puede proteger la sesión en este equipo')
   }
 }
 
-export function saveOBSConfig(config: OBSConfigInput): void {
-  assertEncryptionAvailable()
-  const encrypted = safeStorage.encryptString(JSON.stringify(config)).toString('base64')
-  getStore().set('obsEncrypted', encrypted)
+export function saveOperatorRefresh(username: string, refresh: string): void {
+  encryptionRequired()
+  const encrypted = safeStorage.encryptString(refresh).toString('base64')
+  const store = getStore()
+  store.set('operatorRefreshEncrypted', encrypted)
+  store.set('operatorUsername', username)
 }
 
-export function loadOBSConfig(): OBSConfigInput | null {
-  const encrypted = getStore().get('obsEncrypted')
-  if (encrypted) {
-    assertEncryptionAvailable()
-    const json = safeStorage.decryptString(Buffer.from(encrypted, 'base64'))
-    return JSON.parse(json) as OBSConfigInput
-  }
+export function loadOperatorRefresh(): { username: string; refresh: string } | null {
+  const store = getStore()
+  const username = store.get('operatorUsername')
+  const encrypted = store.get('operatorRefreshEncrypted')
+  if (!username || !encrypted) return null
+  encryptionRequired()
+  return { username, refresh: safeStorage.decryptString(Buffer.from(encrypted, 'base64')) }
+}
 
-  const legacyStore = getLegacyStore()
-  const legacy = legacyStore.get('obs')
-  if (legacy && safeStorage.isEncryptionAvailable()) {
-    saveOBSConfig(legacy)
-    legacyStore.delete('obs')
-    return legacy
-  }
-
-  return null
+export function clearOperatorRefresh(): void {
+  const store = getStore()
+  store.delete('operatorUsername')
+  store.delete('operatorRefreshEncrypted')
 }
 
 export function getLocalPathPreference(): string | null {
   return getStore().get('localPath') ?? null
 }
 
-function getOBSStatus(): OBSConfigStatus {
-  const config = loadOBSConfig()
-  return {
-    configured: config !== null,
-    endpoint: config?.endpoint ?? '',
-    bucket: config?.bucket ?? '',
-    accessKeyIdHint: config ? `••••${config.accessKeyId.slice(-4)}` : ''
-  }
+function getOperatorStatus(): OperatorStatus {
+  const username = getStore().get('operatorUsername')
+  return { configured: Boolean(username), username: username ?? '', displayName: '', tenantId: null }
 }
 
 function getPreference<T>(_event: IpcMainInvokeEvent, key: PreferenceKey): T | undefined {
@@ -122,5 +106,5 @@ function setPreference(_event: IpcMainInvokeEvent, key: PreferenceKey, value: un
 export const configHandlers = {
   'config:getPreference': getPreference,
   'config:setPreference': setPreference,
-  'config:getOBSStatus': () => getOBSStatus()
+  'config:getOperatorStatus': () => getOperatorStatus()
 }

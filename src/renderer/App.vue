@@ -17,10 +17,21 @@ const showSettings = computed(() => uiStore.activeModal === 'settings')
 onMounted(async () => {
   await configStore.loadConfig()
 
-  if (!configStore.hasOBSConfig) {
+  if (!configStore.hasOperatorSession) {
     uiStore.openModal('settings')
   }
 })
+
+async function logout(): Promise<void> {
+  try {
+    await configStore.logout()
+    uiStore.openModal('settings')
+  } catch (error) {
+    uiStore.openModal('settings')
+    uiStore.notify({ type: 'warning', title: 'Sesión local cerrada',
+      message: `No se pudo confirmar la revocación remota: ${(error as Error).message}`, duration: 0 })
+  }
+}
 </script>
 
 <template>
@@ -32,9 +43,15 @@ onMounted(async () => {
         <span class="app-header-title">ClubF5 · Cargador de música</span>
         <span class="safe-label">Solo carga · nunca elimina</span>
       </div>
-      <button @click="uiStore.openModal('settings')" class="btn btn-secondary">
-        Configuración
-      </button>
+      <div class="flex items-center gap-3">
+        <span v-if="configStore.hasOperatorSession" class="text-xs text-slate-500">
+          {{ configStore.operator.displayName || configStore.operator.username }}
+        </span>
+        <button v-if="configStore.hasOperatorSession" @click="logout" class="btn btn-secondary">
+          Cerrar sesión
+        </button>
+        <button v-else @click="uiStore.openModal('settings')" class="btn btn-secondary">Ingresar</button>
+      </div>
     </div>
 
     <div class="main-content">
