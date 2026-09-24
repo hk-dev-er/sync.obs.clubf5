@@ -4,7 +4,9 @@ import { useConfigStore } from '../stores/configStore'
 import { destinationLabel } from '../../shared/uploadPolicy'
 
 const configStore = useConfigStore()
-const destination = computed(() => destinationLabel(configStore.destination))
+const destination = computed(() => configStore.hasAuthorizedDestination
+  ? destinationLabel(configStore.destination)
+  : 'Elegí una carpeta')
 </script>
 
 <template>

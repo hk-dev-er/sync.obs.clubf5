@@ -45,6 +45,8 @@ const conflicts = computed(() => plan.value?.items.filter(item => item.kind === 
 const replacements = computed(() => conflicts.value.filter(item => item.decision === 'replace'))
 const uploads = computed(() => newItems.value.filter(item => item.decision === 'upload'))
 const actionItems = computed(() => [...uploads.value, ...replacements.value])
+const unchangedCount = computed(() => (plan.value?.counts.identical ?? 0) +
+  (plan.value?.counts.remoteOnly ?? 0) + conflicts.value.length - replacements.value.length)
 const progressBytes = computed(() => Math.min(uploadTotalBytes.value, completedBytes.value + currentTransferred.value))
 const progressPercent = computed(() => uploadTotalBytes.value === 0
   ? 0
@@ -71,7 +73,12 @@ watch(
   () => [configStore.isConnected, configStore.connectionRevision] as const,
   ([connected]) => {
     if (connected) void loadMusicFolders()
-    else musicFolders.value = []
+    else {
+      folderLoadRequest += 1
+      musicFolders.value = []
+      loadingMusicFolders.value = false
+      configStore.setAvailableDestinations([])
+    }
   },
   { immediate: true }
 )
@@ -101,6 +108,7 @@ async function loadMusicFolders(): Promise<void> {
     const folders = await window.electronAPI.obsListMusicFolders()
     if (request !== folderLoadRequest) return
     musicFolders.value = folders
+    configStore.setAvailableDestinations(folders)
     if (folders.length === 0) {
       uiStore.notify({
         type: 'error',
@@ -115,12 +123,13 @@ async function loadMusicFolders(): Promise<void> {
       uiStore.notify({
         type: 'warning',
         title: 'Elegí la carpeta de destino',
-        message: 'La carpeta guardada ya no está asignada a tu cuenta.'
+        message: 'Seleccioná una de las carpetas disponibles.'
       })
     }
   } catch (error) {
     if (request !== folderLoadRequest) return
     musicFolders.value = []
+    configStore.setAvailableDestinations([])
     uiStore.notify({
       type: 'error',
       title: 'No se pudieron cargar las carpetas musicales',
@@ -176,6 +185,9 @@ async function analyze(): Promise<void> {
     }
 
     plan.value = buildUploadPlan(local.files, remote)
+    for (const notification of uiStore.notifications.filter(item => item.title === 'No se pudo comparar')) {
+      uiStore.removeNotification(notification.id)
+    }
     uiStore.notify({
       type: 'success',
       title: 'Comparación terminada',
@@ -305,6 +317,9 @@ async function runUpload(items: UploadPlanItem[], seedEntries: UploadReportEntry
       duration: 0
     })
   } else {
+    // A completed upload changes OBS, so the previous comparison is no longer current.
+    plan.value = null
+    scanResult.value = null
     uiStore.notify({ type: 'success', title: 'Carga terminada y verificada' })
   }
 }
@@ -443,8 +458,8 @@ async function retryFailed(): Promise<void> {
 
       <section class="action-bar">
         <div>
-          <strong>{{ uploads.length }} nuevos · {{ replacements.length }} reemplazos</strong>
-          <p>{{ plan.counts.identical + plan.counts.remoteOnly + conflicts.length - replacements.length }} archivos quedan sin cambios.</p>
+          <strong>{{ uploads.length }} {{ uploads.length === 1 ? 'nuevo' : 'nuevos' }} · {{ replacements.length }} {{ replacements.length === 1 ? 'reemplazo' : 'reemplazos' }}</strong>
+          <p>{{ unchangedCount }} {{ unchangedCount === 1 ? 'archivo queda' : 'archivos quedan' }} sin cambios.</p>
         </div>
         <button class="btn btn-primary" :disabled="actionItems.length === 0" @click="requestConfirmation">Revisar carga</button>
       </section>
@@ -452,7 +467,7 @@ async function retryFailed(): Promise<void> {
       <section v-if="confirming" class="confirmation-panel">
         <div>
           <p class="eyebrow">Confirmación final</p>
-          <h2>Se cargarán {{ uploads.length }} archivos nuevos y se reemplazarán {{ replacements.length }}.</h2>
+          <h2>Se cargarán {{ uploads.length }} {{ uploads.length === 1 ? 'archivo nuevo' : 'archivos nuevos' }} y se {{ replacements.length === 1 ? 'reemplazará' : 'reemplazarán' }} {{ replacements.length }}.</h2>
           <p v-if="replacements.length">Cada reemplazo guarda primero una copia del archivo anterior.</p>
           <p>Ningún archivo remoto será eliminado.</p>
         </div>

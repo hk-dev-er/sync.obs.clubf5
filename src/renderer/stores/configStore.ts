@@ -8,6 +8,7 @@ type Theme = 'light' | 'dark' | 'system'
 export const useConfigStore = defineStore('config', () => {
   const localPath = ref('')
   const destination = ref<DestinationPrefix>('Music/online/Progressive/')
+  const availableDestinations = ref<DestinationPrefix[]>([])
   const theme = ref<Theme>('system')
   const operator = ref<OperatorStatus>({ configured: false, username: '', displayName: '', tenantId: null })
   const isConnected = ref(false)
@@ -16,6 +17,8 @@ export const useConfigStore = defineStore('config', () => {
   const connectionError = ref<string | null>(null)
 
   const hasOperatorSession = computed(() => operator.value.configured && isConnected.value)
+  const hasAuthorizedDestination = computed(() =>
+    isConnected.value && availableDestinations.value.includes(destination.value))
   const effectiveTheme = computed<'light' | 'dark'>(() => {
     if (theme.value === 'system') {
       return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
@@ -71,6 +74,7 @@ export const useConfigStore = defineStore('config', () => {
     } finally {
       operator.value = { configured: false, username: '', displayName: '', tenantId: null }
       isConnected.value = false
+      availableDestinations.value = []
       connectionRevision.value += 1
     }
   }
@@ -85,6 +89,10 @@ export const useConfigStore = defineStore('config', () => {
     await window.electronAPI.setPreference('destination', value)
   }
 
+  function setAvailableDestinations(value: DestinationPrefix[]): void {
+    availableDestinations.value = value
+  }
+
   async function saveTheme(value: Theme): Promise<void> {
     theme.value = value
     await window.electronAPI.setPreference('theme', value)
@@ -95,7 +103,7 @@ export const useConfigStore = defineStore('config', () => {
     if (theme.value === 'system') applyTheme()
   })
 
-  return { localPath, destination, theme, operator, isConnected, connectionRevision,
-    isLoading, connectionError, hasOperatorSession, effectiveTheme, loadConfig,
-    login, logout, saveLocalPath, saveDestination, saveTheme, applyTheme }
+  return { localPath, destination, availableDestinations, theme, operator, isConnected, connectionRevision,
+    isLoading, connectionError, hasOperatorSession, hasAuthorizedDestination, effectiveTheme, loadConfig,
+    login, logout, saveLocalPath, saveDestination, setAvailableDestinations, saveTheme, applyTheme }
 })
