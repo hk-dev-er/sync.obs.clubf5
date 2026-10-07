@@ -10,13 +10,17 @@ import {
 } from './uploadPolicy'
 
 describe('upload policy', () => {
-  it('admite cualquier carpeta musical directa bajo Music/online', () => {
+  it('admite carpetas musicales directas o anidadas bajo Music/online', () => {
     expect(buildObjectKey('Music/online/Organic House/', 'Artist/track.ogg'))
       .toBe('Music/online/Organic House/Artist/track.ogg')
     expect(() => buildObjectKey('otra/', 'track.ogg')).toThrow(/no está autorizada/)
     expect(() => buildObjectKey('Music/online/', 'track.ogg')).toThrow(/no está autorizada/)
-    expect(() => buildObjectKey('Music/online/Progressive/Subcarpeta/', 'track.ogg')).toThrow(/no está autorizada/)
+    expect(buildObjectKey('Music/online/Progressive/Subcarpeta/', 'track.ogg'))
+      .toBe('Music/online/Progressive/Subcarpeta/track.ogg')
     expect(isAllowedDestination('Music/online/Carpeta\nFalsa/')).toBe(false)
+    expect(isAllowedDestination('Music/online/Progressive/Especiales/')).toBe(true)
+    expect(isAllowedDestination('Music/online/Progressive/../')).toBe(false)
+    expect(isAllowedDestination('Music/online/Progressive//')).toBe(false)
   })
 
   it('deriva la carpeta directa sin confundir subcarpetas', () => {
@@ -26,7 +30,7 @@ describe('upload policy', () => {
     expect(destinationLabel('Music/online/Melodic_Techno/')).toBe('Melodic Techno')
   })
 
-  it('filtra, ordena y deduplica únicamente carpetas musicales directas descubiertas en OBS', () => {
+  it('filtra, ordena y deduplica carpetas musicales autorizables', () => {
     expect(musicDestinationsFromCommonPrefixes([
       { Prefix: 'Music/online/Progressive/' },
       { Prefix: 'Music/online/Organic_House/' },
@@ -37,12 +41,15 @@ describe('upload policy', () => {
       null
     ])).toEqual([
       'Music/online/Organic_House/',
+      'Music/online/Organic_House/2026/',
       'Music/online/Progressive/'
     ])
   })
 
   it('rechaza traversal y extensiones distintas de OGG', () => {
     expect(() => normalizeRelativePath('../track.ogg')).toThrow(/inválida/)
+    expect(() => normalizeRelativePath('100% música.ogg')).toThrow(/inválida/)
+    expect(() => normalizeRelativePath('carpeta//tema.ogg')).toThrow(/inválida/)
     expect(() => buildObjectKey('Music/online/Progressive/', 'track.mp3')).toThrow(/Solo se permiten/)
   })
 

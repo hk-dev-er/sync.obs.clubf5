@@ -7,9 +7,11 @@ import { pathToFileURL } from 'url'
 import type { LocalAudioFile } from '../shared/syncPlan'
 import type { LocalScanResult, ScanProgress } from '../shared/contracts'
 import { getLocalPathPreference } from './configService'
+import { normalizeRelativePath } from '../shared/uploadPolicy'
 
 function comparablePath(value: string): string {
-  return process.platform === 'win32' ? value.toLowerCase() : value
+  const normalized = value.normalize('NFC')
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
 export async function validateLocalAudioPath(filePath: string, relativePath?: string): Promise<string> {
@@ -111,6 +113,7 @@ async function scanLocalAudio(event: IpcMainInvokeEvent, rootPath: string): Prom
     event.sender.send('scan:progress', progress)
 
     try {
+      normalizeRelativePath(file.relativePath)
       const digests = await hashAndValidateOgg(file.path)
       files.push({
         name: path.basename(file.path),

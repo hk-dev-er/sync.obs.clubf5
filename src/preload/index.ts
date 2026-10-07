@@ -1,8 +1,8 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type {
   LocalScanResult,
-  OBSConfigInput,
-  OBSConfigStatus,
+  OperatorLogin,
+  OperatorStatus,
   ScanProgress,
   UploadProgress,
   UploadReport,
@@ -30,11 +30,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('config:getPreference', key),
   setPreference: (key: 'localPath' | 'destination' | 'theme', value: string): Promise<void> =>
     ipcRenderer.invoke('config:setPreference', key, value),
-  getOBSStatus: (): Promise<OBSConfigStatus> => ipcRenderer.invoke('config:getOBSStatus'),
-
-  obsConfigure: (config: OBSConfigInput): Promise<boolean> => ipcRenderer.invoke('obs:configure', config),
-  obsConnectStored: (): Promise<boolean> => ipcRenderer.invoke('obs:connectStored'),
-  obsTestConnection: (): Promise<boolean> => ipcRenderer.invoke('obs:testConnection'),
+  getOperatorStatus: (): Promise<OperatorStatus> => ipcRenderer.invoke('config:getOperatorStatus'),
+  operatorLogin: (credentials: OperatorLogin): Promise<OperatorStatus> => ipcRenderer.invoke('auth:login', credentials),
+  operatorConnectStored: (): Promise<OperatorStatus | null> => ipcRenderer.invoke('auth:connectStored'),
+  operatorLogout: (): Promise<void> => ipcRenderer.invoke('auth:logout'),
   obsListMusicFolders: (): Promise<DestinationPrefix[]> => ipcRenderer.invoke('obs:listMusicFolders'),
   obsListAllObjects: (prefix: DestinationPrefix): Promise<RemoteAudioFile[]> =>
     ipcRenderer.invoke('obs:listAllObjects', prefix),

@@ -1,7 +1,7 @@
 import type {
   LocalScanResult,
-  OBSConfigInput,
-  OBSConfigStatus,
+  OperatorLogin,
+  OperatorStatus,
   RemoteObjectMetadata,
   ScanProgress,
   UploadProgress,
@@ -20,11 +20,10 @@ export interface ElectronAPI {
 
   getPreference: <T>(key: 'localPath' | 'destination' | 'theme') => Promise<T | undefined>
   setPreference: (key: 'localPath' | 'destination' | 'theme', value: string) => Promise<void>
-  getOBSStatus: () => Promise<OBSConfigStatus>
-
-  obsConfigure: (config: OBSConfigInput) => Promise<boolean>
-  obsConnectStored: () => Promise<boolean>
-  obsTestConnection: () => Promise<boolean>
+  getOperatorStatus: () => Promise<OperatorStatus>
+  operatorLogin: (credentials: OperatorLogin) => Promise<OperatorStatus>
+  operatorConnectStored: () => Promise<OperatorStatus | null>
+  operatorLogout: () => Promise<void>
   obsListMusicFolders: () => Promise<DestinationPrefix[]>
   obsListAllObjects: (prefix: DestinationPrefix) => Promise<RemoteAudioFile[]>
   obsGetObjectMetadata: (key: string) => Promise<RemoteObjectMetadata | null>

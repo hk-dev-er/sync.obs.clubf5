@@ -45,9 +45,9 @@ describe('config service startup', () => {
   })
 
   it('crea el directorio de configuración recién cuando recibe una consulta', () => {
-    const status = configHandlers['config:getOBSStatus']()
+    const status = configHandlers['config:getOperatorStatus']()
 
-    expect(status).toEqual({ configured: false, endpoint: '', bucket: '', accessKeyIdHint: '' })
+    expect(status).toEqual({ configured: false, username: '', displayName: '', tenantId: null })
     expect(existsSync(userData)).toBe(true)
     expect(testState.constructorCalls).toBe(2)
   })
